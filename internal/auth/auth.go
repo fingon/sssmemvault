@@ -20,6 +20,27 @@ const (
 	GRPCMetadataSignatureKey = "x-request-signature"
 )
 
+// checkCIDRAllowed verifies if the requesting IP matches any of the allowed CIDRs for the peer.
+// It logs configuration errors for invalid CIDRs but skips them for the check.
+func checkCIDRAllowed(requestingIP net.IP, peerIP string, allowedCIDRs []string) bool {
+	for _, cidrStr := range allowedCIDRs {
+		_, network, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			// Log config error, but don't fail auth for this specific request based on bad config.
+			// A stricter approach could fail here.
+			slog.Error("Configuration error: invalid CIDR in allowed_source_cidrs for peer", "peer_ip", peerIP, "cidr", cidrStr, "err", err)
+			continue // Skip this invalid CIDR
+		}
+		if network.Contains(requestingIP) {
+			slog.Debug("Source IP check passed", "requesting_ip", requestingIP, "matched_cidr", cidrStr)
+			return true // Allowed
+		}
+	}
+	// If loop finishes without finding a match
+	slog.Warn("Authentication failed: requesting IP does not match allowed CIDRs for peer", "requesting_ip", requestingIP, "configured_peer_ip", peerIP, "allowed_cidrs", allowedCIDRs)
+	return false // Not allowed
+}
+
 // VerifyRequest extracts authentication details (peer IP, timestamp, signature)
 // and verifies them against the node's configuration.
 func VerifyRequest(peerIP, requestTimestampStr, signatureB64 string, cfg *config.Config) error {
@@ -43,29 +64,16 @@ func VerifyRequest(peerIP, requestTimestampStr, signatureB64 string, cfg *config
 		slog.Debug("Performing source IP CIDR check", "requesting_ip", peerIP, "configured_peer_ip", peerIP, "allowed_cidrs", peerCfg.AllowedSourceCIDRs)
 		requestingIP := net.ParseIP(peerIP)
 		if requestingIP == nil {
+			// This check should ideally happen earlier, but keep it for safety.
 			slog.Warn("Authentication failed: could not parse requesting peer IP", "requesting_ip", peerIP)
 			return fmt.Errorf("authentication failed: could not parse requesting IP %s", peerIP)
 		}
 
-		allowed := false
-		for _, cidrStr := range peerCfg.AllowedSourceCIDRs {
-			_, network, err := net.ParseCIDR(cidrStr)
-			if err != nil {
-				// Log config error, but don't fail auth for this specific request based on bad config.
-				// A stricter approach could fail here.
-				slog.Error("Configuration error: invalid CIDR in allowed_source_cidrs for peer", "peer_ip", peerIP, "cidr", cidrStr, "err", err)
-				continue // Skip this invalid CIDR
-			}
-			if network.Contains(requestingIP) {
-				slog.Debug("Source IP check passed", "requesting_ip", peerIP, "matched_cidr", cidrStr)
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			slog.Warn("Authentication failed: requesting IP does not match allowed CIDRs for peer", "requesting_ip", peerIP, "configured_peer_ip", peerIP, "allowed_cidrs", peerCfg.AllowedSourceCIDRs)
+		if !checkCIDRAllowed(requestingIP, peerIP, peerCfg.AllowedSourceCIDRs) {
+			// Error details are logged within checkCIDRAllowed
 			return fmt.Errorf("authentication failed: requesting IP %s is not allowed by configured CIDRs for peer %s", peerIP, peerIP)
 		}
+		// If checkCIDRAllowed returns true, proceed.
 	} else {
 		slog.Debug("Skipping source IP CIDR check (not configured for peer)", "requesting_ip", peerIP, "configured_peer_ip", peerIP)
 	}

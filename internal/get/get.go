@@ -50,17 +50,8 @@ func loadConfigAndDeriveParams(getCfg *Config) (*config.Config, error) {
 		if appCfg.Peers == nil || len(appCfg.Peers) == 0 {
 			return nil, errors.New("config file specified but contains no peers to use as targets")
 		}
+		// Endpoints are validated during config.LoadConfig, so we assume they exist here.
 		for _, peerCfg := range appCfg.Peers {
-			if peerCfg.Endpoint == "" {
-				var peerIP string
-				for ip, pc := range appCfg.Peers {
-					if pc.Endpoint == peerCfg.Endpoint {
-						peerIP = ip
-						break
-					}
-				}
-				return nil, fmt.Errorf("peer %q in config file is missing endpoint", peerIP)
-			}
 			getCfg.Targets = append(getCfg.Targets, peerCfg.Endpoint)
 		}
 		slog.Info("Using targets derived from config file", "count", len(getCfg.Targets))
