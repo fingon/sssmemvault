@@ -11,7 +11,7 @@ import (
 	"github.com/fingon/sssmemvault/internal/config"
 	"github.com/fingon/sssmemvault/internal/crypto"
 	pb "github.com/fingon/sssmemvault/proto"
-	"github.com/google/tink/go/tink"
+	"github.com/tink-crypto/tink-go/v2/tink"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure" // Use insecure for now, consider TLS later
 	"google.golang.org/grpc/metadata"

@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/google/tink/go/hybrid"
-	"github.com/google/tink/go/insecurecleartextkeyset"
-	"github.com/google/tink/go/keyset"
-	"github.com/google/tink/go/signature"
-	"github.com/google/tink/go/tink"
+	"github.com/tink-crypto/tink-go/v2/hybrid"
+	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset"
+	"github.com/tink-crypto/tink-go/v2/keyset"
+	"github.com/tink-crypto/tink-go/v2/signature"
+	"github.com/tink-crypto/tink-go/v2/tink"
 )
 
 // LoadPrivateKey loads a Tink private keyset from a file and returns primitives.

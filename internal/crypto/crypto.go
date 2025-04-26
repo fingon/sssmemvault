@@ -7,8 +7,8 @@ import (
 	"maps"
 
 	pb "github.com/fingon/sssmemvault/proto"
-	"github.com/google/tink/go/tink"
 	"github.com/hashicorp/vault/shamir"
+	"github.com/tink-crypto/tink-go/v2/tink"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )

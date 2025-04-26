@@ -6,14 +6,16 @@ tool golang.org/x/tools/cmd/goimports
 
 require (
 	github.com/alecthomas/kong v1.10.0
-	github.com/google/tink/go v1.7.0
 	github.com/hashicorp/vault v1.19.2
+	github.com/tink-crypto/tink-go/v2 v2.2.0
 	google.golang.org/grpc v1.72.0
 	google.golang.org/protobuf v1.36.6
 	gopkg.in/yaml.v3 v3.0.1
+	gotest.tools/v3 v3.5.2
 )
 
 require (
+	github.com/google/go-cmp v0.7.0 // indirect
 	golang.org/x/crypto v0.37.0 // indirect
 	golang.org/x/mod v0.24.0 // indirect
 	golang.org/x/net v0.39.0 // indirect

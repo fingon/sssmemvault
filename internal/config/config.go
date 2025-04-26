@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/fingon/sssmemvault/internal/crypto"
-	"github.com/google/tink/go/tink"
+	"github.com/tink-crypto/tink-go/v2/tink"
 	"gopkg.in/yaml.v3"
 )
 

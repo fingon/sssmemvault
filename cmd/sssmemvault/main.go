@@ -12,14 +12,14 @@ import (
 	// --- Register Tink Primitives ---
 	// Import Tink primitives for side effects (registration)
 	// Ensure all necessary primitives used by any command are registered here.
-	_ "github.com/google/tink/go/aead"             // Register standard AEAD key types
-	_ "github.com/google/tink/go/aead/subtle"      // Needed for some hybrid encryption key types if used indirectly
-	_ "github.com/google/tink/go/hybrid"           // Register standard Hybrid key types
-	_ "github.com/google/tink/go/hybrid/subtle"    // For DHKEM_X25519 etc. used in hybrid encryption/decryption
-	_ "github.com/google/tink/go/keyset"           // For keyset Handle creation/loading
-	_ "github.com/google/tink/go/signature"        // Register standard Signature key types
-	_ "github.com/google/tink/go/signature/subtle" // For ED25519, ECDSA used in signing/verification
-	_ "github.com/google/tink/go/tink"             // Core Tink library
+	_ "github.com/tink-crypto/tink-go/v2/aead"             // Register standard AEAD key types
+	_ "github.com/tink-crypto/tink-go/v2/aead/subtle"      // Needed for some hybrid encryption key types if used indirectly
+	_ "github.com/tink-crypto/tink-go/v2/hybrid"           // Register standard Hybrid key types
+	_ "github.com/tink-crypto/tink-go/v2/hybrid/subtle"    // For DHKEM_X25519 etc. used in hybrid encryption/decryption
+	_ "github.com/tink-crypto/tink-go/v2/keyset"           // For keyset Handle creation/loading
+	_ "github.com/tink-crypto/tink-go/v2/signature"        // Register standard Signature key types
+	_ "github.com/tink-crypto/tink-go/v2/signature/subtle" // For ED25519, ECDSA used in signing/verification
+	_ "github.com/tink-crypto/tink-go/v2/tink"             // Core Tink library
 )
 
 // Global CLI flags

@@ -11,7 +11,7 @@ import (
 	"github.com/fingon/sssmemvault/internal/node"
 	"github.com/fingon/sssmemvault/internal/store"
 	pb "github.com/fingon/sssmemvault/proto"
-	"github.com/google/tink/go/tink"
+	"github.com/tink-crypto/tink-go/v2/tink"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
