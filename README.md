@@ -9,6 +9,9 @@ of more than one node is needed for secret to be available. Finally,
 secret fragments may be encrypted so that only specific third party
 can actually combine them to usable secret.
 
+Master private key is not owned by any of the nodes, but it is used to
+provision secrets.
+
 The state of the system consists of entries, signed by master public key. with:
 
 - timestamp
@@ -32,16 +35,22 @@ timestamp wins.
 - GRPC requests are allowed only if they contain header, which has
   request timestamp which is recent enough, and is signed using
   private key of the IP address request originates from.
-  
+
 
 ## Configuration file (for each node) ##
 
 - path to their private key file
 
-- list of other nodes
+- master public key
+
+- list of other nodes, with each having:
+
   - GRPC endpoint
+
   - public key
-  - flag which indicates whether or not the node should be polled
+
+  - optional poll duration flag (Go duration style, e.g. 60m), which
+    indicates that node should be polled with that frequency
 
 ## Requests ##
 
@@ -52,3 +61,7 @@ timestamp wins.
 - Get decoded (timestamp, key) request: Returns the decrypted
   owner-specific SSS fragment, if the requesting node IP is in the
   readers list.
+
+## Implementation
+
+Modern Go, using Google's Tink library to get algorithm agility.
