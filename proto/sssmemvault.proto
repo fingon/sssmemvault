@@ -14,6 +14,8 @@ service SssMemVault {
   rpc Get(GetRequest) returns (GetResponse);
   // Get the decrypted SSS fragment for the calling node, if authorized
   rpc GetDecoded(GetDecodedRequest) returns (GetDecodedResponse);
+  // Push a new entry, signed by the master key (bypasses peer auth)
+  rpc Push(PushRequest) returns (PushResponse);
 }
 
 // Represents a single secret entry stored in the vault
@@ -62,3 +64,11 @@ message GetDecodedRequest {
 message GetDecodedResponse {
   bytes decrypted_fragment = 1; // The SSS fragment, decrypted by the owner node
 }
+
+// Request message for the Push RPC
+message PushRequest {
+  Entry entry = 1; // The full entry, signed by the master key
+}
+
+// Response message for the Push RPC (currently empty)
+message PushResponse {}

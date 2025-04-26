@@ -55,10 +55,19 @@ func AuthInterceptor(cfg *config.Config) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		slog.Debug("AuthInterceptor: processing request", "method", info.FullMethod)
 
+		// Skip authentication for the Push method, which relies on master key signature verification
+		if info.FullMethod == "/sssmemvault.SssMemVault/Push" {
+			slog.Debug("AuthInterceptor: skipping peer auth for Push method")
+			return handler(ctx, req)
+		}
+
+		// --- Proceed with standard peer authentication for other methods ---
+		slog.Debug("AuthInterceptor: performing peer authentication", "method", info.FullMethod)
+
 		// 1. Extract Peer IP
 		p, ok := peer.FromContext(ctx)
 		if !ok {
-			slog.Error("AuthInterceptor: failed to get peer from context")
+			slog.Error("AuthInterceptor: failed to get peer from context", "method", info.FullMethod)
 			return nil, status.Error(codes.Internal, "Failed to identify peer")
 		}
 		peerIP, err := auth.GetPeerIP(p)
@@ -216,4 +225,51 @@ func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecode
 	}
 	slog.Info("GetDecoded request successful", "key", req.Key, "timestamp", req.Timestamp.AsTime(), "requesting_peer_ip", requestingPeerIP)
 	return resp, nil
+}
+
+// Push receives a new entry signed by the master key and adds it to the store.
+// This method bypasses the standard peer authentication interceptor.
+func (self *SssMemVaultServer) Push(_ context.Context, req *pb.PushRequest) (*pb.PushResponse, error) {
+	entry := req.GetEntry()
+	if entry == nil || entry.Timestamp == nil || entry.Key == "" {
+		slog.Warn("Push request rejected: invalid entry", "entry_nil", entry == nil)
+		return nil, status.Error(codes.InvalidArgument, "Invalid entry: cannot be nil, must have timestamp and key")
+	}
+	slog.Debug("Handling Push request", "key", entry.Key, "timestamp", entry.Timestamp.AsTime())
+
+	// 1. Verify the master signature (this is the primary auth mechanism for Push)
+	// Note: The store's AddOrUpdateEntry also verifies, but verifying here first
+	// provides a clearer separation of concerns for the Push endpoint's auth.
+	err := crypto.VerifyEntrySignature(self.cfg.MasterPubKey, entry)
+	if err != nil {
+		slog.Warn("Push request rejected: master signature verification failed",
+			"key", entry.Key,
+			"timestamp", entry.Timestamp.AsTime(),
+			"err", err)
+		// Return PermissionDenied as the signature is the 'permission' for Push
+		return nil, status.Errorf(codes.PermissionDenied, "Master signature verification failed: %v", err)
+	}
+	slog.Debug("Push request master signature verified successfully", "key", entry.Key)
+
+	// 2. Add the entry to the store
+	// AddOrUpdateEntry handles timestamp comparison and potential overwrites,
+	// and performs its own signature verification as a safety measure.
+	updated, err := self.store.AddOrUpdateEntry(entry)
+	if err != nil {
+		// This could be a redundant signature failure or another store issue.
+		slog.Error("Failed to store entry from Push request",
+			"key", entry.Key,
+			"timestamp", entry.Timestamp.AsTime(),
+			"err", err)
+		// Use Internal error code as the signature was already verified once.
+		return nil, status.Errorf(codes.Internal, "Failed to store pushed entry: %v", err)
+	}
+
+	if updated {
+		slog.Info("Successfully processed Push request and updated store", "key", entry.Key, "timestamp", entry.Timestamp.AsTime())
+	} else {
+		slog.Info("Processed Push request, but store was not updated (entry already exists with same or newer timestamp)", "key", entry.Key, "timestamp", entry.Timestamp.AsTime())
+	}
+
+	return &pb.PushResponse{}, nil
 }

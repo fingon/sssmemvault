@@ -4,8 +4,8 @@
 # Copyright (c) 2025 Markus Stenberg
 #
 # Created:       Sun Apr 13 08:23:25 2025 mstenber
-# Last modified: Sat Apr 26 16:11:42 2025 mstenber
-# Edit time:     4 min
+# Last modified: Sat Apr 26 16:50:34 2025 mstenber
+# Edit time:     7 min
 #
 #
 
@@ -15,9 +15,18 @@ GENERATED=\
 	proto/sssmemvault.pb.go \
 	proto/sssmemvault_grpc.pb.go
 
+BINARIES=\
+	sssmemvaultd \
+	sssmemvault-push
+
+.PHONY: all
+all: ci
+
+.PHONY: binaries
+binaries: $(BINARIES)
 
 .PHONY: ci
-ci: lint test
+ci: lint test  $(BINARIES)
 
 .PHONY: generate
 generate: $(GENERATED)
@@ -39,7 +48,6 @@ lint:
 	mv $@.tmp $@
 	go tool goimports -w $@
 
-
 %_grpc.pb.go: %.proto
 	protoc \
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
@@ -47,3 +55,6 @@ lint:
 	grep -v "^//.*protoc\s.*v" $@ > $@.tmp
 	mv $@.tmp $@
 	go tool goimports -w $@
+
+$(BINARIES):
+	go build -o $@ ./cmd/$*

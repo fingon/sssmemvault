@@ -22,6 +22,7 @@ const (
 	SssMemVault_List_FullMethodName       = "/sssmemvault.SssMemVault/List"
 	SssMemVault_Get_FullMethodName        = "/sssmemvault.SssMemVault/Get"
 	SssMemVault_GetDecoded_FullMethodName = "/sssmemvault.SssMemVault/GetDecoded"
+	SssMemVault_Push_FullMethodName       = "/sssmemvault.SssMemVault/Push"
 )
 
 // SssMemVaultClient is the client API for SssMemVault service.
@@ -36,6 +37,8 @@ type SssMemVaultClient interface {
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	// Get the decrypted SSS fragment for the calling node, if authorized
 	GetDecoded(ctx context.Context, in *GetDecodedRequest, opts ...grpc.CallOption) (*GetDecodedResponse, error)
+	// Push a new entry, signed by the master key (bypasses peer auth)
+	Push(ctx context.Context, in *PushRequest, opts ...grpc.CallOption) (*PushResponse, error)
 }
 
 type sssMemVaultClient struct {
@@ -76,6 +79,16 @@ func (c *sssMemVaultClient) GetDecoded(ctx context.Context, in *GetDecodedReques
 	return out, nil
 }
 
+func (c *sssMemVaultClient) Push(ctx context.Context, in *PushRequest, opts ...grpc.CallOption) (*PushResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PushResponse)
+	err := c.cc.Invoke(ctx, SssMemVault_Push_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SssMemVaultServer is the server API for SssMemVault service.
 // All implementations must embed UnimplementedSssMemVaultServer
 // for forward compatibility.
@@ -88,6 +101,8 @@ type SssMemVaultServer interface {
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	// Get the decrypted SSS fragment for the calling node, if authorized
 	GetDecoded(context.Context, *GetDecodedRequest) (*GetDecodedResponse, error)
+	// Push a new entry, signed by the master key (bypasses peer auth)
+	Push(context.Context, *PushRequest) (*PushResponse, error)
 	mustEmbedUnimplementedSssMemVaultServer()
 }
 
@@ -106,6 +121,9 @@ func (UnimplementedSssMemVaultServer) Get(context.Context, *GetRequest) (*GetRes
 }
 func (UnimplementedSssMemVaultServer) GetDecoded(context.Context, *GetDecodedRequest) (*GetDecodedResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetDecoded not implemented")
+}
+func (UnimplementedSssMemVaultServer) Push(context.Context, *PushRequest) (*PushResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Push not implemented")
 }
 func (UnimplementedSssMemVaultServer) mustEmbedUnimplementedSssMemVaultServer() {}
 func (UnimplementedSssMemVaultServer) testEmbeddedByValue()                     {}
@@ -182,6 +200,24 @@ func _SssMemVault_GetDecoded_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SssMemVault_Push_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PushRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SssMemVaultServer).Push(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SssMemVault_Push_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SssMemVaultServer).Push(ctx, req.(*PushRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SssMemVault_ServiceDesc is the grpc.ServiceDesc for SssMemVault service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -200,6 +236,10 @@ var SssMemVault_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetDecoded",
 			Handler:    _SssMemVault_GetDecoded_Handler,
+		},
+		{
+			MethodName: "Push",
+			Handler:    _SssMemVault_Push_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

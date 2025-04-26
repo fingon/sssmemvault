@@ -86,3 +86,43 @@ func LoadPublicKeyVerifier(path string) (tink.Verifier, error) {
 
 	return verifier, nil
 }
+
+// LoadMasterPrivateKeySigner loads only the signer primitive from a master private keyset file.
+func LoadMasterPrivateKeySigner(path string) (tink.Signer, error) {
+	jsonKeyset, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read master private keyset file %q: %w", path, err)
+	}
+
+	kh, err := insecurecleartextkeyset.Read(keyset.NewJSONReader(bytes.NewReader(jsonKeyset)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read master private keyset from %q: %w", path, err)
+	}
+
+	signer, err := signature.NewSigner(kh)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signer from master private keyset %q: %w", path, err)
+	}
+
+	return signer, nil
+}
+
+// LoadOwnerPublicKeyEncrypter loads only the hybrid encrypter primitive from an owner public keyset file.
+func LoadOwnerPublicKeyEncrypter(path string) (tink.HybridEncrypt, error) {
+	jsonKeyset, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read owner public keyset file %q: %w", path, err)
+	}
+
+	kh, err := insecurecleartextkeyset.Read(keyset.NewJSONReader(bytes.NewReader(jsonKeyset)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read owner public keyset from %q: %w", path, err)
+	}
+
+	encrypt, err := hybrid.NewHybridEncrypt(kh)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create hybrid encrypt from owner public keyset %q: %w", path, err)
+	}
+
+	return encrypt, nil
+}
