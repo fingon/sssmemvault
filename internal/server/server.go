@@ -30,7 +30,7 @@ type SssMemVaultServer struct {
 }
 
 // NewSssMemVaultServer creates a new server instance.
-func NewSssMemVaultServer(s *store.InMemoryStore, cfg *config.Config) (*SssMemVaultServer, error) {
+func NewSssMemVaultServer(s *store.InMemoryStore, cfg *config.Config, myIP string) (*SssMemVaultServer, error) {
 	if s == nil {
 		return nil, errors.New("store cannot be nil")
 	}
@@ -40,13 +40,13 @@ func NewSssMemVaultServer(s *store.InMemoryStore, cfg *config.Config) (*SssMemVa
 	if cfg.PrivKeyDecrypter == nil {
 		return nil, errors.New("config is missing private key decrypter")
 	}
-	if cfg.MyIP == "" {
-		return nil, errors.New("config is missing node IP (my_ip)")
+	if myIP == "" {
+		return nil, errors.New("myIP cannot be empty")
 	}
 	return &SssMemVaultServer{
 		store:  s,
 		cfg:    cfg,
-		nodeIP: cfg.MyIP,
+		nodeIP: myIP,
 	}, nil
 }
 

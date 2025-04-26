@@ -123,18 +123,17 @@ echo "Manually create node2_private.json containing appropriate ECDSA and DHKEM 
 tinkey create-public-keyset --in node2_private.json --out node2_public.json
 ```
 
-**4. Create Configuration Files**
+**4. Create Configuration File**
 
 Place the generated public keys (`master_public.json`, `node1_public.json`, `node2_public.json`) and the respective private keys (`node1_private.json`, `node2_private.json`) where the nodes can access them.
 
-**`config_node1.yaml` (for 192.168.42.2):**
+**`config.yaml`:**
 
 ```yaml
-# config_node1.yaml
-private_key_path: "node1_private.json" # Path to Node 1's private key
+# config.yaml
+private_key_path: "private.json" # Path to modes private key
 master_public_key: "master_public.json" # Path to Master public key
 listen_address: ":59240"
-my_ip: "192.168.42.2" # This node's IP
 max_timestamp_skew: 30s
 
 peers:
@@ -144,23 +143,6 @@ peers:
     poll_interval: "60s" # Poll Node 2 every 60 seconds
 ```
 
-**`config_node2.yaml` (for 192.168.42.34):**
-
-```yaml
-# config_node2.yaml
-private_key_path: "node2_private.json" # Path to Node 2's private key
-master_public_key: "master_public.json" # Path to Master public key
-listen_address: ":59240"
-my_ip: "192.168.42.34" # This node's IP
-max_timestamp_skew: 30s
-
-peers:
-  "192.168.42.2": # Peer is Node 1
-    endpoint: "192.168.42.2:59240"
-    public_key: "node1_public.json" # Path to Node 1's public key
-    poll_interval: "60s" # Poll Node 1 every 60 seconds
-```
-
 **5. Run the Daemons**
 
 Ensure the `sssmemvaultd` binary is built (`go build ./cmd/sssmemvaultd`).
@@ -168,16 +150,16 @@ Ensure the `sssmemvaultd` binary is built (`go build ./cmd/sssmemvaultd`).
 **On Node 1 (192.168.42.2):**
 
 ```bash
-./sssmemvaultd --config config_node1.yaml --loglevel debug
+./sssmemvaultd --config config.yaml --my-ip 192.168.42.2 --loglevel debug
 ```
 
 **On Node 2 (192.168.42.34):**
 
 ```bash
-./sssmemvaultd --config config_node2.yaml --loglevel debug
+./sssmemvaultd --config config.yaml --my-ip 192.168.42.34 --loglevel debug
 ```
 
-The nodes will now start, connect to each other based on the configuration, listen for incoming requests, and periodically poll peers specified with `poll_interval`.
+The nodes will now start, connect to each other based on the configuration (using the *same* config file if desired), listen for incoming requests using their specified `--my-ip`, and periodically poll peers specified with `poll_interval`.
 
 **6. Provisioning a Secret with `sssmemvault-push`**
 
@@ -187,7 +169,7 @@ Use the `sssmemvault-push` tool (build it with `go build ./cmd/sssmemvault-push`
 # Example: Push a secret named "api-key" with value "supersecret123"
 # Owned by Node 1 and Node 2 (2 parts, threshold 2)
 # Readable by Node 1, Node 2, and an external client 10.0.0.5
-# Push the entry to both Node 1 and Node 2
+# Push the entry to both Node 1 and Node 2 using explicit flags:
 
 ./sssmemvault-push \
   --master-key master_private.json \
@@ -203,9 +185,24 @@ Use the `sssmemvault-push` tool (build it with `go build ./cmd/sssmemvault-push`
   --target 192.168.42.2:59240 \
   --target 192.168.42.34:59240 \
   --loglevel info
+
+# Alternatively, push using a config file to source owners and targets:
+
+./sssmemvault-push \
+  --master-key master_private.json \
+  --config config.yaml \
+  --reader 192.168.42.2 \
+  --reader 192.168.42.34 \
+  --reader 10.0.0.5 \
+  --key "api-key" \
+  --secret "supersecret123" \
+  --parts 2 \
+  --threshold 2 \
+  --loglevel info
+
 ```
 
-This command will:
+These commands will:
 1. Load the master private key (`master_private.json`).
 2. Load the public keys for the owners (`node1_public.json`, `node2_public.json`).
 3. Split the secret `"supersecret123"` into 2 fragments with a threshold of 2.

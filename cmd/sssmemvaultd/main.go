@@ -24,6 +24,7 @@ import (
 // CLI holds the command-line arguments and flags.
 type CLI struct {
 	ConfigPath string `kong:"name='config',short='c',default='config.yaml',help='Path to the configuration file.'"`
+	MyIP       string `kong:"name='my-ip',required,help='This node's externally reachable IP address.'"`
 	LogLevel   string `kong:"name='loglevel',enum='debug,info,warn,error',default='info',help='Log level (debug, info, warn, error).'"`
 }
 
@@ -134,7 +135,7 @@ func runApp(cli *CLI) int {
 	)
 
 	// Create and register the service implementation
-	sssServer, err := server.NewSssMemVaultServer(localStore, cfg)
+	sssServer, err := server.NewSssMemVaultServer(localStore, cfg, cli.MyIP)
 	if err != nil {
 		slog.Error("Failed to create SSS MemVault server implementation", "err", err)
 		return 1

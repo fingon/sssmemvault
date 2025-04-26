@@ -36,7 +36,7 @@ type Config struct {
 	ListenAddress    string                `yaml:"listen_address"`     // e.g., ":59240"
 	Peers            map[string]PeerConfig `yaml:"peers"`              // Map: Peer IP -> PeerConfig
 	MaxTimestampSkew time.Duration         `yaml:"max_timestamp_skew"` // e.g., 30s
-	MyIP             string                `yaml:"my_ip"`              // This node's externally reachable IP (must match an owner IP in entries)
+	// MyIP             string                `yaml:"my_ip"` // Removed: Provided via CLI flag now
 
 	// Internal fields populated after loading
 	PrivKeySigner    tink.Signer            `yaml:"-"` // Tink private key signer
@@ -68,9 +68,7 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.MasterPublicKey == "" {
 		return nil, errors.New("config validation failed: master_public_key is required")
 	}
-	if cfg.MyIP == "" {
-		return nil, errors.New("config validation failed: my_ip is required")
-	}
+	// my_ip validation removed, provided via CLI flag
 	if cfg.MaxTimestampSkew <= 0 {
 		return nil, errors.New("config validation failed: max_timestamp_skew must be positive")
 	}
