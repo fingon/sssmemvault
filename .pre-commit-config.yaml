@@ -1,0 +1,40 @@
+repos:
+# These are good pretty much anywhere
+- repo: meta
+  hooks:
+    - id: check-hooks-apply
+    - id: check-useless-excludes
+
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v5.0.0  # Use the ref you want to point at
+  hooks:
+    - id: check-case-conflict
+    # - id: check-executables-have-shebangs # n/a - yet
+    - id: check-merge-conflict
+    # - id: check-symlinks # we by design have some dynamically generated ones
+    - id: check-yaml
+    - id: detect-private-key
+    - id: end-of-file-fixer
+    - id: forbid-submodules
+    - id: mixed-line-ending
+    #- id: no-commit-to-branch
+    #  args: ['--branch', 'master']
+    # - id: pretty-format-json
+    - id: trailing-whitespace
+
+# Local configuration
+- repo: local
+  hooks:
+  - id: golangci-lint
+    name: "Run golangci-lint"
+    language: system
+    types: [go]
+    pass_filenames: false
+    entry: make lint
+
+  - id: go-mod-tidy
+    name: "Run go mod tidy"
+    language: system
+    files: '^go\.(mod|sum)$'
+    pass_filenames: false
+    entry: go mod tidy -v
