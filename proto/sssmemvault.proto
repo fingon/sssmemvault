@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package sssmemvault;
+
+option go_package = "github.com/fingon/sssmemvault/proto"; // Adjust 'github.com/fingon/sssmemvault' to your actual module path
+
+import "google/protobuf/timestamp.proto";
+
+// Service definition for node-to-node communication
+service SssMemVault {
+  // List available keys and their latest timestamps
+  rpc List(ListRequest) returns (ListResponse);
+  // Get the full signed entry for a specific key and timestamp
+  rpc Get(GetRequest) returns (GetResponse);
+  // Get the decrypted SSS fragment for the calling node, if authorized
+  rpc GetDecoded(GetDecodedRequest) returns (GetDecodedResponse);
+}
+
+// Represents a single secret entry stored in the vault
+message Entry {
+  google.protobuf.Timestamp timestamp = 1;
+  string key = 2;
+  repeated string readers = 3; // List of IPs allowed to get decoded fragments
+  map<string, bytes> owner_fragments = 4; // Map: Owner IP -> Encrypted SSS Fragment
+  bytes signature = 5; // Master public key signature over the entry data (excluding this field)
+}
+
+// Metadata for an entry, used in ListResponse
+message EntryMetadata {
+  google.protobuf.Timestamp timestamp = 1;
+  string key = 2;
+}
+
+// Request message for the List RPC
+message ListRequest {
+  // Potentially add filters later if needed
+}
+
+// Response message for the List RPC
+message ListResponse {
+  repeated EntryMetadata entries = 1;
+}
+
+// Request message for the Get RPC
+message GetRequest {
+  google.protobuf.Timestamp timestamp = 1;
+  string key = 2;
+}
+
+// Response message for the Get RPC
+message GetResponse {
+  Entry entry = 1;
+}
+
+// Request message for the GetDecoded RPC
+message GetDecodedRequest {
+  google.protobuf.Timestamp timestamp = 1;
+  string key = 2;
+}
+
+// Response message for the GetDecoded RPC
+message GetDecodedResponse {
+  bytes decrypted_fragment = 1; // The SSS fragment, decrypted by the owner node
+}
