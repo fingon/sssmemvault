@@ -15,18 +15,16 @@ GENERATED=\
 	proto/sssmemvault.pb.go \
 	proto/sssmemvault_grpc.pb.go
 
-BINARIES=\
-	sssmemvaultd \
-	sssmemvault-push
+BINARY=sssmemvault
 
 .PHONY: all
 all: ci
 
 .PHONY: binaries
-binaries: $(BINARIES)
+binaries: $(BINARY)
 
 .PHONY: ci
-ci: lint test  $(BINARIES)
+ci: lint test $(BINARY)
 
 .PHONY: generate
 generate: $(GENERATED)
@@ -56,5 +54,10 @@ lint:
 	mv $@.tmp $@
 	go tool goimports -w $@
 
-$(BINARIES):
-	go build -o $@ ./cmd/$*
+$(BINARY): $(GENERATED)
+	go build -o $@ ./cmd/$@
+
+# Clean target (optional but good practice)
+.PHONY: clean
+clean:
+	rm -f $(BINARY) $(GENERATED)

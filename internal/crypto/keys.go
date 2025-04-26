@@ -126,3 +126,30 @@ func LoadOwnerPublicKeyEncrypter(path string) (tink.HybridEncrypt, error) {
 
 	return encrypt, nil
 }
+
+// LoadPrivateKeySigner loads only the signer primitive from a private keyset file.
+// Useful for clients that only need to authenticate requests.
+func LoadPrivateKeySigner(path string) (tink.Signer, error) {
+	jsonKeyset, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read private keyset file %q: %w", path, err)
+	}
+
+	kh, err := insecurecleartextkeyset.Read(keyset.NewJSONReader(bytes.NewReader(jsonKeyset)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read private keyset from %q: %w", path, err)
+	}
+
+	signer, err := signature.NewSigner(kh)
+	if err != nil {
+		// Check if the keyset might be missing a signing key
+		_, verifyErr := signature.NewVerifier(kh)
+		if verifyErr == nil {
+			// It has a verification key, but not a signing key. Wrong key type loaded.
+			return nil, fmt.Errorf("keyset in %q contains a public verification key, but a private signing key is required: %w", path, err)
+		}
+		return nil, fmt.Errorf("failed to create signer from private keyset %q: %w", path, err)
+	}
+
+	return signer, nil
+}

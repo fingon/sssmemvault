@@ -1,34 +1,31 @@
-package main
+package push
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/alecthomas/kong"
 	"github.com/fingon/sssmemvault/internal/config"
 	"github.com/fingon/sssmemvault/internal/crypto"
+	"github.com/fingon/sssmemvault/internal/node"
 	pb "github.com/fingon/sssmemvault/proto"
-	_ "github.com/google/tink/go/hybrid/subtle"    // Register DHKEM
-	_ "github.com/google/tink/go/signature/subtle" // Register ED25519, ECDSA
 	"github.com/google/tink/go/tink"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // OwnerInfo holds the IP and public key path for an owner node.
+// Duplicated from old main, consider moving to a shared internal type if needed elsewhere.
 type OwnerInfo struct {
 	IP        string
 	PublicKey string
 }
 
-// CLI holds the command-line arguments for the push tool.
-type CLI struct {
+// Config holds the specific configuration needed for the push subcommand.
+type Config struct {
 	MasterPrivateKey string   `kong:"name='master-key',required,help='Path to the master private key JSON file (for signing).'"`
 	Owners           []string `kong:"name='owner',optional,help='Owner node info as IP=PublicKeyPath (e.g., 192.168.1.1=owner1_pub.json). Repeat for each owner. Can be sourced from --config.'"`
 	Readers          []string `kong:"name='reader',required,help='IP address of a node allowed to read the secret. Repeat for each reader.'"`
@@ -38,7 +35,7 @@ type CLI struct {
 	Parts            int      `kong:"name='parts',short='p',required,help='Total number of Shamir fragments to create (must match number of owners).'"`
 	Targets          []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
 	ConfigPath       string   `kong:"name='config',optional,help='Path to a configuration file to load parameters from (owners, targets).'"`
-	LogLevel         string   `kong:"name='loglevel',enum='debug,info,warn,error',default='info',help='Log level (debug, info, warn, error).'"`
+	// LogLevel is handled globally
 }
 
 // parseOwner parses the IP=PublicKeyPath string.
@@ -52,141 +49,122 @@ func parseOwner(ownerStr string) (*OwnerInfo, error) {
 }
 
 // loadConfigAndDeriveParams loads the configuration file if specified and updates
-// the CLI struct with owners and targets derived from the config if they weren't
-// provided via command-line flags. It handles logging and exits on error.
-func loadConfigAndDeriveParams(cli *CLI, kctx *kong.Context) *config.Config {
-	if cli.ConfigPath == "" {
-		return nil // No config file specified, nothing to do
+// the push Config struct with owners and targets derived from the config if they weren't
+// provided via command-line flags. It returns the loaded app config or nil.
+func loadConfigAndDeriveParams(pushCfg *Config) (*config.Config, error) {
+	if pushCfg.ConfigPath == "" {
+		return nil, nil // No config file specified, nothing to do
 	}
 
-	slog.Info("Loading configuration file", "path", cli.ConfigPath)
-	cfg, err := config.LoadConfig(cli.ConfigPath)
+	slog.Info("Loading configuration file", "path", pushCfg.ConfigPath)
+	appCfg, err := config.LoadConfig(pushCfg.ConfigPath)
 	if err != nil {
-		slog.Error("Failed to load configuration file", "path", cli.ConfigPath, "err", err)
-		kctx.Exit(1)
+		return nil, fmt.Errorf("failed to load configuration file %q: %w", pushCfg.ConfigPath, err)
 	}
-	slog.Info("Configuration loaded successfully", "path", cli.ConfigPath)
+	slog.Info("Configuration loaded successfully", "path", pushCfg.ConfigPath)
 
 	// Populate owners from config if not provided via flags
-	if len(cli.Owners) == 0 {
+	if len(pushCfg.Owners) == 0 {
 		slog.Debug("Populating owners from config file")
-		if cfg.LoadedPeers == nil || len(cfg.LoadedPeers) == 0 {
-			slog.Error("Config file specified but contains no peers to use as owners")
-			kctx.Exit(1)
+		if appCfg.Peers == nil || len(appCfg.Peers) == 0 {
+			return nil, errors.New("config file specified but contains no peers to use as owners")
 		}
-		// Use cfg.Peers to get the original public key path, as LoadedPeers contains primitives
-		if cfg.Peers == nil {
-			slog.Error("Internal inconsistency: LoadedPeers exists but original Peers map is nil")
-			kctx.Exit(1)
-		}
-		for ip, peerCfg := range cfg.Peers {
+		for ip, peerCfg := range appCfg.Peers {
 			if peerCfg.PublicKey == "" {
-				slog.Error("Peer in config file is missing public_key path", "ip", ip)
-				kctx.Exit(1)
+				// This check might be redundant if LoadConfig enforces it, but good defense.
+				return nil, fmt.Errorf("peer %q in config file is missing public_key path", ip)
 			}
-			cli.Owners = append(cli.Owners, fmt.Sprintf("%s=%s", ip, peerCfg.PublicKey))
+			pushCfg.Owners = append(pushCfg.Owners, fmt.Sprintf("%s=%s", ip, peerCfg.PublicKey))
 		}
-		slog.Info("Using owners derived from config file", "count", len(cli.Owners))
+		slog.Info("Using owners derived from config file", "count", len(pushCfg.Owners))
 	}
 
 	// Populate targets from config if not provided via flags
-	if len(cli.Targets) == 0 {
+	if len(pushCfg.Targets) == 0 {
 		slog.Debug("Populating targets from config file")
-		if cfg.LoadedPeers == nil || len(cfg.LoadedPeers) == 0 {
-			slog.Error("Config file specified but contains no peers to use as targets")
-			kctx.Exit(1)
+		if appCfg.Peers == nil || len(appCfg.Peers) == 0 {
+			return nil, errors.New("config file specified but contains no peers to use as targets")
 		}
-		for ip, peerCfg := range cfg.LoadedPeers {
+		for _, peerCfg := range appCfg.Peers { // Iterate over original Peers map
 			if peerCfg.Endpoint == "" {
-				slog.Error("Peer in config file is missing endpoint", "ip", ip)
-				kctx.Exit(1)
+				// This check might be redundant if LoadConfig enforces it.
+				// Need the IP for the error message, iterate over map instead of LoadedPeers
+				// Find the IP corresponding to this peerCfg (less efficient but works)
+				var peerIP string
+				for ip, pc := range appCfg.Peers {
+					if pc.Endpoint == peerCfg.Endpoint { // Assuming endpoint is unique enough for this lookup
+						peerIP = ip
+						break
+					}
+				}
+				return nil, fmt.Errorf("peer %q in config file is missing endpoint", peerIP)
 			}
-			cli.Targets = append(cli.Targets, peerCfg.Endpoint)
+			pushCfg.Targets = append(pushCfg.Targets, peerCfg.Endpoint)
 		}
-		slog.Info("Using targets derived from config file", "count", len(cli.Targets))
+		slog.Info("Using targets derived from config file", "count", len(pushCfg.Targets))
 	}
-	return cfg
+	return appCfg, nil
 }
 
-func main() {
-	var cli CLI
-	kctx := kong.Parse(&cli)
-
-	// --- Setup Logging ---
-	var level slog.Level
-	switch cli.LogLevel {
-	case "debug":
-		level = slog.LevelDebug
-	case "info":
-		level = slog.LevelInfo
-	case "warn":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		fmt.Fprintf(os.Stderr, "Invalid log level: %s\n", cli.LogLevel)
-		os.Exit(1)
-	}
-	logHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}) // Log to stderr for tools
-	slog.SetDefault(slog.New(logHandler))
-
-	// --- Register Tink Primitives ---
-	// Ensure necessary Tink primitives are registered via side-effect imports.
-	// Explicit registration calls are generally not needed if using the standard Tink setup.
-	slog.Debug("Tink primitives should be registered via imports")
+// Run executes the push operation.
+func Run(pushCfg *Config) int {
+	slog.Info("Starting push operation...")
 
 	// --- Load Config if specified and derive parameters ---
-	// Note: cfg might be nil if ConfigPath is empty, which is fine.
-	_ = loadConfigAndDeriveParams(&cli, kctx) // We don't need the cfg object itself in main anymore
+	_, err := loadConfigAndDeriveParams(pushCfg)
+	if err != nil {
+		slog.Error("Failed to load or process configuration", "err", err)
+		return 1
+	}
 
 	// --- Validate Inputs (Post-Config Load/Derivation) ---
-	if len(cli.Owners) == 0 {
+	if len(pushCfg.Owners) == 0 {
 		slog.Error("No owners specified. Provide via --owner flags or --config file.")
-		kctx.Exit(1)
+		return 1
 	}
-	if cli.Parts != len(cli.Owners) {
-		slog.Error("Number of owners must match the number of parts", "parts", cli.Parts, "owners", len(cli.Owners))
-		kctx.Exit(1)
+	if pushCfg.Parts != len(pushCfg.Owners) {
+		slog.Error("Number of owners must match the number of parts", "parts", pushCfg.Parts, "owners", len(pushCfg.Owners))
+		return 1
 	}
-	if cli.Threshold > cli.Parts {
-		slog.Error("Threshold cannot be greater than the number of parts", "threshold", cli.Threshold, "parts", cli.Parts)
-		kctx.Exit(1)
+	if pushCfg.Threshold > pushCfg.Parts {
+		slog.Error("Threshold cannot be greater than the number of parts", "threshold", pushCfg.Threshold, "parts", pushCfg.Parts)
+		return 1
 	}
-	if cli.Threshold <= 0 {
-		slog.Error("Threshold must be positive", "threshold", cli.Threshold)
-		kctx.Exit(1)
+	if pushCfg.Threshold <= 0 {
+		slog.Error("Threshold must be positive", "threshold", pushCfg.Threshold)
+		return 1
 	}
-	if len(cli.Readers) == 0 {
+	if len(pushCfg.Readers) == 0 {
 		slog.Error("At least one reader IP must be specified")
-		kctx.Exit(1)
+		return 1
 	}
-	if len(cli.Targets) == 0 {
+	if len(pushCfg.Targets) == 0 {
 		slog.Error("No targets specified. Provide via --target flags or --config file.")
-		kctx.Exit(1)
+		return 1
 	}
 
 	// --- Load Master Key ---
-	slog.Debug("Loading master private key", "path", cli.MasterPrivateKey)
-	masterSigner, err := crypto.LoadMasterPrivateKeySigner(cli.MasterPrivateKey)
+	slog.Debug("Loading master private key", "path", pushCfg.MasterPrivateKey)
+	masterSigner, err := crypto.LoadMasterPrivateKeySigner(pushCfg.MasterPrivateKey)
 	if err != nil {
-		slog.Error("Failed to load master private key", "path", cli.MasterPrivateKey, "err", err)
-		kctx.Exit(1)
+		slog.Error("Failed to load master private key", "path", pushCfg.MasterPrivateKey, "err", err)
+		return 1
 	}
 	slog.Info("Loaded master private key successfully")
 
 	// --- Load Owner Public Keys (using parsed/derived owner info) ---
 	ownerKeys := make(map[string]tink.HybridEncrypt) // Map: IP -> Encrypter
-	ownerInfos := make([]*OwnerInfo, 0, len(cli.Owners))
+	ownerInfos := make([]*OwnerInfo, 0, len(pushCfg.Owners))
 	ownerIPSet := make(map[string]struct{}) // To check for duplicate IPs
-	for _, ownerStr := range cli.Owners {
+	for _, ownerStr := range pushCfg.Owners {
 		ownerInfo, err := parseOwner(ownerStr)
 		if err != nil {
 			slog.Error("Failed to parse owner info", "input", ownerStr, "err", err)
-			kctx.Exit(1)
+			return 1
 		}
 		if _, exists := ownerIPSet[ownerInfo.IP]; exists {
 			slog.Error("Duplicate owner IP specified", "ip", ownerInfo.IP)
-			kctx.Exit(1)
+			return 1
 		}
 		ownerIPSet[ownerInfo.IP] = struct{}{}
 		ownerInfos = append(ownerInfos, ownerInfo) // Keep order for fragment assignment
@@ -196,18 +174,18 @@ func main() {
 		encrypter, err := crypto.LoadOwnerPublicKeyEncrypter(ownerInfo.PublicKey)
 		if err != nil {
 			slog.Error("Failed to load owner public key", "ip", ownerInfo.IP, "path", ownerInfo.PublicKey, "err", err)
-			kctx.Exit(1)
+			return 1
 		}
 		ownerKeys[ownerInfo.IP] = encrypter
 		slog.Info("Loaded owner public key", "ip", ownerInfo.IP)
 	}
 
 	// --- Split Secret ---
-	slog.Debug("Splitting secret", "parts", cli.Parts, "threshold", cli.Threshold)
-	fragments, err := crypto.SplitSecret([]byte(cli.Secret), cli.Parts, cli.Threshold)
+	slog.Debug("Splitting secret", "parts", pushCfg.Parts, "threshold", pushCfg.Threshold)
+	fragments, err := crypto.SplitSecret([]byte(pushCfg.Secret), pushCfg.Parts, pushCfg.Threshold)
 	if err != nil {
 		slog.Error("Failed to split secret", "err", err)
-		kctx.Exit(1)
+		return 1
 	}
 	slog.Info("Secret split into fragments", "count", len(fragments))
 
@@ -216,7 +194,7 @@ func main() {
 	if len(fragments) != len(ownerInfos) {
 		// This should not happen if SplitSecret worked correctly
 		slog.Error("Internal error: fragment count mismatch", "fragments", len(fragments), "owners", len(ownerInfos))
-		kctx.Exit(1)
+		return 1
 	}
 
 	for i, ownerInfo := range ownerInfos {
@@ -226,7 +204,7 @@ func main() {
 		encrypted, err := crypto.EncryptFragment(encrypter, fragment)
 		if err != nil {
 			slog.Error("Failed to encrypt fragment for owner", "owner_ip", ownerInfo.IP, "err", err)
-			kctx.Exit(1)
+			return 1
 		}
 		encryptedFragments[ownerInfo.IP] = encrypted
 		slog.Info("Encrypted fragment", "owner_ip", ownerInfo.IP)
@@ -235,8 +213,8 @@ func main() {
 	// --- Construct Entry ---
 	entry := &pb.Entry{
 		Timestamp:      timestamppb.Now(),
-		Key:            cli.Key,
-		Readers:        cli.Readers, // Already a slice of strings
+		Key:            pushCfg.Key,
+		Readers:        pushCfg.Readers, // Already a slice of strings
 		OwnerFragments: encryptedFragments,
 		// Signature will be added next
 	}
@@ -247,7 +225,7 @@ func main() {
 	err = crypto.SignEntry(masterSigner, entry)
 	if err != nil {
 		slog.Error("Failed to sign entry", "err", err)
-		kctx.Exit(1)
+		return 1
 	}
 	slog.Info("Entry signed successfully")
 
@@ -258,12 +236,19 @@ func main() {
 	errorCount := 0
 	var mu sync.Mutex // To protect counters
 
-	for _, target := range cli.Targets {
+	// Use a shared context for all push operations
+	pushCtx, pushCancel := context.WithTimeout(context.Background(), 60*time.Second) // Overall timeout for pushing
+	defer pushCancel()
+
+	for _, target := range pushCfg.Targets {
 		wg.Add(1)
 		go func(targetEndpoint string) {
 			defer wg.Done()
 			slog.Info("Connecting to target node", "endpoint", targetEndpoint)
-			conn, err := grpc.NewClient(targetEndpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			// Use node.ConnectToPeer for consistency, though we don't need the full PeerNode struct here
+			// We need a client connection. Let's simplify for push.
+			// TODO: Refactor connection logic to be more reusable.
+			conn, err := node.DialPeer(pushCtx, targetEndpoint) // Use a simplified dial function
 			if err != nil {
 				slog.Error("Failed to connect to target", "endpoint", targetEndpoint, "err", err)
 				mu.Lock()
@@ -271,11 +256,6 @@ func main() {
 				mu.Unlock()
 				return
 			}
-			// defer conn.Close()
-
-			client := pb.NewSssMemVaultClient(conn)
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Add timeout
-			defer cancel()
 			defer func() {
 				err := conn.Close()
 				if err != nil {
@@ -283,15 +263,20 @@ func main() {
 				}
 			}()
 
-			slog.Info("Pushing entry to target", "endpoint", targetEndpoint, "key", cli.Key)
-			_, err = client.Push(ctx, pushRequest)
+			client := pb.NewSssMemVaultClient(conn)
+			// Use a derived context with a shorter timeout for the actual RPC call
+			callCtx, callCancel := context.WithTimeout(pushCtx, 30*time.Second)
+			defer callCancel()
+
+			slog.Info("Pushing entry to target", "endpoint", targetEndpoint, "key", pushCfg.Key)
+			_, err = client.Push(callCtx, pushRequest) // Use callCtx
 
 			mu.Lock()
 			if err != nil {
-				slog.Error("Failed to push entry to target", "endpoint", targetEndpoint, "key", cli.Key, "err", err)
+				slog.Error("Failed to push entry to target", "endpoint", targetEndpoint, "key", pushCfg.Key, "err", err)
 				errorCount++
 			} else {
-				slog.Info("Successfully pushed entry to target", "endpoint", targetEndpoint, "key", cli.Key)
+				slog.Info("Successfully pushed entry to target", "endpoint", targetEndpoint, "key", pushCfg.Key)
 				successCount++
 			}
 			mu.Unlock()
@@ -302,7 +287,7 @@ func main() {
 	slog.Info("Push operation complete", "successful_targets", successCount, "failed_targets", errorCount)
 
 	if errorCount > 0 {
-		kctx.Exit(1) // Exit with error if any push failed
+		return 1 // Exit with error if any push failed
 	}
-	kctx.Exit(0) // Exit successfully
+	return 0 // Exit successfully
 }
