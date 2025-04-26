@@ -111,21 +111,13 @@ Nodes need a private keyset containing *both* a signing key (e.g., ECDSA_P256) f
 *Creating a combined keyset might require manual JSON editing or specific Tink library usage, as `tinkey` might not directly create a single keyset with both types.*
 
 ```bash
-# Generate Node 1 signing key
-tinkey create-keyset --key-template ECDSA_P256 --out node1_private_sig.json
-# Generate Node 1 hybrid key
-tinkey create-keyset --key-template DHKEM_X25519_HKDF_SHA256_AES_256_GCM --out node1_private_hybrid.json
-
-# *** Manually combine the key material from both files into node1_private.json ***
-# The JSON structure should look something like:
-# {
-#   "primaryKeyId": <ID of one key>,
-#   "key": [
-#     { /* Key material from node1_private_sig.json */ },
-#     { /* Key material from node1_private_hybrid.json */ }
-#   ]
-# }
-echo "Manually create node1_private.json containing keys from node1_private_sig.json and node1_private_hybrid.json"
+# Generate Node 1 initial signing key
+tinkey create-keyset --key-template ECDSA_P256 --out node1_private.json
+# Add Node 1 hybrid key to the same keyset
+tinkey add-key --in node1_private.json --key-template DHKEM_X25519_HKDF_SHA256_AES_256_GCM --out node1_private.json
+# (Optional) Set one key as primary if needed (Tink usually handles this)
+# tinkey set-primary --in node1_private.json --key-id <key_id_from_list_output> --out node1_private.json
+# tinkey list --in node1_private.json # To see key IDs
 
 # Create Node 1 public keyset from the combined private keyset
 tinkey create-public-keyset --in node1_private.json --out node1_public.json
@@ -136,12 +128,11 @@ tinkey create-public-keyset --in node1_private.json --out node1_public.json
 Repeat the process for Node 2, creating `node2_private.json` and `node2_public.json`.
 
 ```bash
-# Generate Node 2 signing key
-tinkey create-keyset --key-template ECDSA_P256 --out node2_private_sig.json
-# Generate Node 2 hybrid key
-tinkey create-keyset --key-template DHKEM_X25519_HKDF_SHA256_AES_256_GCM --out node2_private_hybrid.json
-# *** Manually combine into node2_private.json ***
-echo "Manually create node2_private.json containing appropriate ECDSA and DHKEM keys"
+# Generate Node 2 initial signing key
+tinkey create-keyset --key-template ECDSA_P256 --out node2_private.json
+# Add Node 2 hybrid key to the same keyset
+tinkey add-key --in node2_private.json --key-template DHKEM_X25519_HKDF_SHA256_AES_256_GCM --out node2_private.json
+
 # Create Node 2 public keyset
 tinkey create-public-keyset --in node2_private.json --out node2_public.json
 ```
@@ -184,19 +175,27 @@ peers:
   "192.168.42.2":
     endpoint: "192.168.42.2:59240"
     public_key: "node1_public.json" # Node 1's public keyset (verify + encrypt)
+    # Optional: Restrict requests using Node 1's key to only come from its specific IP
+    # allowed_source_cidrs: ["192.168.42.2/32"]
     # poll_interval: "60s" # Optional: Poll Node 1 every 60 seconds
 
   # Configuration for Node 2 (used by Node 1 daemon)
   "192.168.42.34":
     endpoint: "192.168.42.34:59240"
     public_key: "node2_public.json" # Node 2's public keyset (verify + encrypt)
+    # Optional: Allow requests using Node 2's key from its IP or a specific management subnet
+    allowed_source_cidrs: ["192.168.42.34/32", "10.1.2.0/24"]
     poll_interval: "60s" # Poll Node 2 every 60 seconds
 
   # Configuration for the Client (used by Node 1 & 2 daemons for auth verification)
+  # The client itself doesn't run a daemon, but nodes need its public key
+  # to verify requests originating from the client's IP.
   # The client itself doesn't run a daemon, but nodes need its public key.
   "10.0.0.5":
     endpoint: "" # Endpoint not needed as client doesn't listen
     public_key: "client_public.json" # Client's public key (verification only)
+    # Optional: Ensure requests using the client key ONLY come from the client's IP
+    allowed_source_cidrs: ["10.0.0.5/32"]
     # poll_interval not applicable
 ```
 

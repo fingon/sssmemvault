@@ -25,3 +25,6 @@
 - if same value repeats multiple times in a code file, make it a constant
 
 - avoid writing comments about obvious actions, such as calling a function
+
+- if there are complex code blocks within ifs, either create
+  sub-functions or prefer returning early

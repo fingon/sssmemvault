@@ -33,12 +33,47 @@ func VerifyRequest(peerIP, requestTimestampStr, signatureB64 string, cfg *config
 	// 1. Find Peer Config and Public Key
 	peerCfg, ok := cfg.LoadedPeers[peerIP]
 	if !ok {
-		slog.Warn("Authentication failed: unknown peer IP", "peer_ip", peerIP)
-		return fmt.Errorf("authentication failed: unknown peer IP %s", peerIP)
+		// If the IP itself isn't in the config, we can't verify anything.
+		slog.Warn("Authentication failed: requesting IP not found in peer configuration", "requesting_ip", peerIP)
+		return fmt.Errorf("authentication failed: requesting IP %s not configured as a peer", peerIP)
 	}
+
+	// 2. Optional: Check Source IP against Allowed CIDRs for the *configured* peer
+	if len(peerCfg.AllowedSourceCIDRs) > 0 {
+		slog.Debug("Performing source IP CIDR check", "requesting_ip", peerIP, "configured_peer_ip", peerIP, "allowed_cidrs", peerCfg.AllowedSourceCIDRs)
+		requestingIP := net.ParseIP(peerIP)
+		if requestingIP == nil {
+			slog.Warn("Authentication failed: could not parse requesting peer IP", "requesting_ip", peerIP)
+			return fmt.Errorf("authentication failed: could not parse requesting IP %s", peerIP)
+		}
+
+		allowed := false
+		for _, cidrStr := range peerCfg.AllowedSourceCIDRs {
+			_, network, err := net.ParseCIDR(cidrStr)
+			if err != nil {
+				// Log config error, but don't fail auth for this specific request based on bad config.
+				// A stricter approach could fail here.
+				slog.Error("Configuration error: invalid CIDR in allowed_source_cidrs for peer", "peer_ip", peerIP, "cidr", cidrStr, "err", err)
+				continue // Skip this invalid CIDR
+			}
+			if network.Contains(requestingIP) {
+				slog.Debug("Source IP check passed", "requesting_ip", peerIP, "matched_cidr", cidrStr)
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			slog.Warn("Authentication failed: requesting IP does not match allowed CIDRs for peer", "requesting_ip", peerIP, "configured_peer_ip", peerIP, "allowed_cidrs", peerCfg.AllowedSourceCIDRs)
+			return fmt.Errorf("authentication failed: requesting IP %s is not allowed by configured CIDRs for peer %s", peerIP, peerIP)
+		}
+	} else {
+		slog.Debug("Skipping source IP CIDR check (not configured for peer)", "requesting_ip", peerIP, "configured_peer_ip", peerIP)
+	}
+
+	// 3. Check Public Key Verifier (essential for signature check)
 	if peerCfg.PubKeyVerifier == nil {
-		// This should not happen if config loading is correct
-		slog.Error("Internal error: peer config found but public key verifier is nil", "peer_ip", peerIP)
+		// This should not happen if config loading is correct and peer was found
+		slog.Error("Internal error: peer config found but public key verifier is nil", "configured_peer_ip", peerIP)
 		return fmt.Errorf("internal error: missing public key for peer %s", peerIP)
 	}
 
@@ -53,7 +88,7 @@ func VerifyRequest(peerIP, requestTimestampStr, signatureB64 string, cfg *config
 		}
 	}
 
-	// 3. Check Timestamp Skew
+	// 4. Check Timestamp Skew
 	now := time.Now().UTC()
 	skew := now.Sub(requestTime)
 	if skew < 0 {
@@ -70,24 +105,24 @@ func VerifyRequest(peerIP, requestTimestampStr, signatureB64 string, cfg *config
 		return fmt.Errorf("authentication failed: timestamp skew too large (skew: %s, max: %s)", skew, cfg.MaxTimestampSkew)
 	}
 
-	// 4. Decode Signature
+	// 5. Decode Signature
 	signatureBytes, err := base64.StdEncoding.DecodeString(signatureB64)
 	if err != nil {
-		slog.Warn("Authentication failed: invalid base64 signature", "peer_ip", peerIP, "err", err)
+		slog.Warn("Authentication failed: invalid base64 signature", "requesting_ip", peerIP, "err", err)
 		return fmt.Errorf("authentication failed: invalid base64 signature: %w", err)
 	}
 
-	// 5. Verify Signature
+	// 6. Verify Signature using the configured peer's public key
 	// The signature must be over the exact timestamp string that was sent.
 	dataToVerify := []byte(requestTimestampStr)
 	err = crypto.VerifySignature(peerCfg.PubKeyVerifier, dataToVerify, signatureBytes)
 	if err != nil {
 		// Don't wrap the crypto error directly, just indicate signature failure.
-		slog.Warn("Authentication failed: invalid signature", "peer_ip", peerIP, "err", err) // Log underlying error
+		slog.Warn("Authentication failed: invalid signature", "requesting_ip", peerIP, "configured_peer_ip", peerIP, "err", err) // Log underlying error
 		return errors.New("authentication failed: invalid signature")
 	}
 
-	slog.Debug("Authentication successful", "peer_ip", peerIP)
+	slog.Debug("Authentication successful", "requesting_ip", peerIP, "configured_peer_ip", peerIP)
 	return nil
 }
 

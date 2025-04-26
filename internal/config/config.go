@@ -20,9 +20,11 @@ const (
 
 // PeerConfig holds configuration for a single peer node.
 type PeerConfig struct {
-	Endpoint     string         `yaml:"endpoint"`      // e.g., "192.168.1.101:59240"
-	PublicKey    string         `yaml:"public_key"`    // Path to peer's public key file
-	PollInterval *time.Duration `yaml:"poll_interval"` // Optional polling frequency (Go duration string)
+	Endpoint     string         `yaml:"endpoint"`                // e.g., "192.168.1.101:59240"
+	PublicKey    string         `yaml:"public_key"`              // Path to peer's public key file
+	PollInterval *time.Duration `yaml:"poll_interval,omitempty"` // Optional polling frequency (Go duration string)
+	// Optional: List of CIDRs allowed to connect using this peer's key. e.g., ["192.168.1.101/32", "2001:db8::/64"]
+	AllowedSourceCIDRs []string `yaml:"allowed_source_cidrs,omitempty"`
 
 	// Internal fields populated after loading
 	PubKeyVerifier  tink.Verifier      `yaml:"-"` // Tink public key verifier
