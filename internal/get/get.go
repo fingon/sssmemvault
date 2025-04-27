@@ -20,6 +20,7 @@ import (
 
 // Config holds the specific configuration needed for the get subcommand.
 type Config struct {
+	ClientName            string   `kong:"name='client-name',required,help='The name of this client (must match a key in target node configs).'"`
 	SigningPrivateKeyPath string   `kong:"name='signing-private-key',required,help='Path to the client private key JSON file (for signing requests).'"`
 	HybridPrivateKeyPath  string   `kong:"name='hybrid-private-key',required,help='Path to the client private key JSON file (for decrypting received fragments).'"`
 	Key                   string   `kong:"name='key',required,help='The key name for the secret to retrieve.'"`
@@ -80,6 +81,10 @@ func Run(getCfg *Config) int {
 		slog.Error("Key cannot be empty.")
 		return 1
 	}
+	if getCfg.ClientName == "" {
+		slog.Error("Client name cannot be empty.")
+		return 1
+	}
 	if getCfg.SigningPrivateKeyPath == "" {
 		slog.Error("Client signing private key path cannot be empty.")
 		return 1
@@ -107,11 +112,13 @@ func Run(getCfg *Config) int {
 	slog.Info("Loaded client hybrid private key successfully")
 
 	// --- Connect to Targets and Find Latest Entry ---
+	// --- Find Latest Entry Across Targets ---
 	// We need to find the latest timestamp for the key across all targets.
 	// We also need the full entry to know the owners and the required threshold.
-	latestEntry, targetEndpointForGet, err := findLatestEntry(getCfg.Targets, getCfg.Key, clientSigner, appCfg)
+	// Pass the client's name for authentication during List/Get calls.
+	latestEntry, targetEndpointForGet, err := findLatestEntry(getCfg.Targets, getCfg.Key, getCfg.ClientName, clientSigner, appCfg)
 	if err != nil {
-		slog.Error("Failed to find latest entry for key", "key", getCfg.Key, "err", err)
+		slog.Error("Failed to find latest entry for key", "key", getCfg.Key, "client_name", getCfg.ClientName, "err", err)
 		return 1
 	}
 	if latestEntry == nil {
@@ -127,38 +134,38 @@ func Run(getCfg *Config) int {
 		return 1
 	}
 
-	ownerIPs := make([]string, 0, len(latestEntry.OwnerFragments))
-	for ip := range latestEntry.OwnerFragments {
-		ownerIPs = append(ownerIPs, ip)
+	ownerNames := make([]string, 0, len(latestEntry.OwnerFragments))
+	for name := range latestEntry.OwnerFragments {
+		ownerNames = append(ownerNames, name)
 	}
-	sort.Strings(ownerIPs) // Consistent ordering for logging/debugging
+	sort.Strings(ownerNames) // Consistent ordering for logging/debugging
 
-	slog.Info("Identified owners for the entry", "key", getCfg.Key, "owners", ownerIPs)
+	slog.Info("Identified owners for the entry", "key", getCfg.Key, "owners", ownerNames)
 
 	// --- Determine Owner Endpoints ---
-	// We need the gRPC endpoints for the owner IPs.
+	// We need the gRPC endpoints for the owner names.
 	// Get them from the loaded config file if available, otherwise fail.
 	if appCfg == nil {
 		slog.Error("Cannot determine owner endpoints without a configuration file (--config)")
 		return 1
 	}
-	ownerEndpoints := make(map[string]string) // Map: Owner IP -> Endpoint
-	for _, ownerIP := range ownerIPs {
-		peerCfg, ok := appCfg.Peers[ownerIP]
-		if !ok || peerCfg.Endpoint == "" {
-			slog.Error("Could not find endpoint for owner in configuration file", "owner_ip", ownerIP, "config_path", getCfg.ConfigPath)
+	ownerEndpoints := make(map[string]string) // Map: Owner Name -> Endpoint
+	for _, ownerName := range ownerNames {
+		peerCfg, ok := appCfg.LoadedPeers[ownerName] // Use LoadedPeers which has pointers
+		if !ok || peerCfg == nil || peerCfg.Endpoint == "" {
+			slog.Error("Could not find endpoint for owner in configuration file", "owner_name", ownerName, "config_path", getCfg.ConfigPath)
 			return 1
 		}
-		ownerEndpoints[ownerIP] = peerCfg.Endpoint
-		slog.Debug("Found endpoint for owner", "owner_ip", ownerIP, "endpoint", peerCfg.Endpoint)
+		ownerEndpoints[ownerName] = peerCfg.Endpoint
+		slog.Debug("Found endpoint for owner", "owner_name", ownerName, "endpoint", peerCfg.Endpoint)
 	}
 
 	// --- Call GetDecoded on Owner Nodes Concurrently ---
-	slog.Info("Requesting encrypted fragments from owner nodes", "owners", ownerIPs)
+	slog.Info("Requesting encrypted fragments from owner nodes", "owners", ownerNames)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	encryptedFragments := make([][]byte, 0, len(ownerIPs)) // Store encrypted fragments first
-	getDecodedErrors := make(map[string]error)
+	encryptedFragments := make([][]byte, 0, len(ownerNames)) // Store encrypted fragments first
+	getDecodedErrors := make(map[string]error)               // Map: Owner Name -> Error
 
 	getDecodedCtx, getDecodedCancel := context.WithTimeout(context.Background(), 60*time.Second) // Timeout for all GetDecoded calls
 	defer getDecodedCancel()
@@ -168,23 +175,22 @@ func Run(getCfg *Config) int {
 		Timestamp: latestEntry.Timestamp,
 	}
 
-	for _, ownerIP := range ownerIPs {
+	for _, ownerName := range ownerNames {
 		wg.Add(1)
-		go func(ip, endpoint string) {
+		go func(name, endpoint string) {
 			defer wg.Done()
-			slog.Debug("Connecting to owner node for GetDecoded", "owner_ip", ip, "endpoint", endpoint)
-			// Reuse connection logic if possible, or simplify
+			slog.Debug("Connecting to owner node for GetDecoded", "owner_name", name, "endpoint", endpoint)
 			conn, err := node.DialPeer(getDecodedCtx, endpoint)
 			if err != nil {
-				slog.Warn("Failed to connect to owner node", "owner_ip", ip, "endpoint", endpoint, "err", err)
+				slog.Warn("Failed to connect to owner node", "owner_name", name, "endpoint", endpoint, "err", err)
 				mu.Lock()
-				getDecodedErrors[ip] = err
+				getDecodedErrors[name] = err
 				mu.Unlock()
 				return
 			}
 			defer func() {
 				if err := conn.Close(); err != nil {
-					slog.Warn("Error closing connection to owner node", "owner_ip", ip, "endpoint", endpoint, "err", err)
+					slog.Warn("Error closing connection to owner node", "owner_name", name, "endpoint", endpoint, "err", err)
 				}
 			}()
 
@@ -192,24 +198,25 @@ func Run(getCfg *Config) int {
 			callCtx, callCancel := context.WithTimeout(getDecodedCtx, 30*time.Second) // Timeout per call
 			defer callCancel()
 
-			slog.Debug("Calling GetDecoded on owner node", "owner_ip", ip, "key", getCfg.Key)
-			resp, err := node.CallGetDecodedFromClient(callCtx, client, clientSigner, getDecodedRequest) // Use specific client call helper
+			slog.Debug("Calling GetDecoded on owner node", "owner_name", name, "key", getCfg.Key)
+			// Pass client name for authentication
+			resp, err := node.CallGetDecodedFromClient(callCtx, client, getCfg.ClientName, clientSigner, getDecodedRequest)
 
 			mu.Lock()
 			switch {
 			case err != nil:
-				slog.Warn("Failed to get encrypted fragments from owner", "owner_ip", ip, "key", getCfg.Key, "err", err)
-				getDecodedErrors[ip] = err
+				slog.Warn("Failed to get encrypted fragments from owner", "owner_name", name, "key", getCfg.Key, "err", err)
+				getDecodedErrors[name] = err
 			case resp == nil || len(resp.EncryptedFragments) == 0: // Check the correct field name (plural)
-				slog.Warn("Received empty encrypted fragment list from owner", "owner_ip", ip, "key", getCfg.Key)
-				getDecodedErrors[ip] = errors.New("received empty encrypted fragment list")
+				slog.Warn("Received empty encrypted fragment list from owner", "owner_name", name, "key", getCfg.Key)
+				getDecodedErrors[name] = errors.New("received empty encrypted fragment list")
 			default:
-				slog.Info("Successfully received encrypted fragments", "owner_ip", ip, "key", getCfg.Key, "count", len(resp.EncryptedFragments))
+				slog.Info("Successfully received encrypted fragments", "owner_name", name, "key", getCfg.Key, "count", len(resp.EncryptedFragments))
 				// Add all received fragments to the list
 				encryptedFragments = append(encryptedFragments, resp.EncryptedFragments...)
 			}
 			mu.Unlock()
-		}(ownerIP, ownerEndpoints[ownerIP])
+		}(ownerName, ownerEndpoints[ownerName])
 	}
 
 	wg.Wait()
@@ -283,8 +290,9 @@ func Run(getCfg *Config) int {
 }
 
 // findLatestEntry queries targets to find the latest timestamp for a key and returns the full entry.
+// It requires the clientName for authenticating requests to the target nodes.
 // The appCfg parameter is currently unused but kept for potential future use (e.g., master key verification).
-func findLatestEntry(targets []string, key string, clientSigner tink.Signer, _ *config.Config) (*pb.Entry, string, error) {
+func findLatestEntry(targets []string, key, clientName string, clientSigner tink.Signer, _ *config.Config) (*pb.Entry, string, error) {
 	var latestTimestamp *timestamppb.Timestamp
 	var latestEntry *pb.Entry
 	var sourceTarget string
@@ -320,10 +328,10 @@ func findLatestEntry(targets []string, key string, clientSigner tink.Signer, _ *
 			callCtx, callCancel := context.WithTimeout(listCtx, 15*time.Second)
 			defer callCancel()
 
-			slog.Debug("Calling List on target", "endpoint", endpoint)
-			listResp, err := node.CallListFromClient(callCtx, client, clientSigner, &pb.ListRequest{})
+			slog.Debug("Calling List on target", "endpoint", endpoint, "client_name", clientName)
+			listResp, err := node.CallListFromClient(callCtx, client, clientName, clientSigner, &pb.ListRequest{})
 			if err != nil {
-				slog.Warn("Failed to call List on target", "endpoint", endpoint, "err", err)
+				slog.Warn("Failed to call List on target", "endpoint", endpoint, "client_name", clientName, "err", err)
 				mu.Lock()
 				listErrors[endpoint] = err
 				mu.Unlock()
@@ -371,9 +379,10 @@ func findLatestEntry(targets []string, key string, clientSigner tink.Signer, _ *
 	defer callCancel()
 
 	getRequest := &pb.GetRequest{Key: key, Timestamp: latestTimestamp}
-	getResp, err := node.CallGetFromClient(callCtx, client, clientSigner, getRequest)
+	slog.Debug("Calling Get on target", "endpoint", sourceTarget, "client_name", clientName, "key", key)
+	getResp, err := node.CallGetFromClient(callCtx, client, clientName, clientSigner, getRequest)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to get full entry for key %q from target %q: %w", key, sourceTarget, err)
+		return nil, "", fmt.Errorf("failed to get full entry for key %q from target %q (client %s): %w", key, sourceTarget, clientName, err)
 	}
 	if getResp == nil || getResp.Entry == nil {
 		return nil, "", fmt.Errorf("received empty response when getting full entry for key %q from target %q", key, sourceTarget)

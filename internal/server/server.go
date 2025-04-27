@@ -15,7 +15,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -24,13 +23,11 @@ type SssMemVaultServer struct {
 	pb.UnimplementedSssMemVaultServer // Embed for forward compatibility
 	store                             *store.InMemoryStore
 	cfg                               *config.Config
-	// nodeIP is the IP address of the node running this server instance.
-	// Needed for GetDecoded to find the correct encrypted fragment.
-	nodeIP string
+	nodeName                          string // The name of the node running this server instance.
 }
 
 // NewSssMemVaultServer creates a new server instance.
-func NewSssMemVaultServer(s *store.InMemoryStore, cfg *config.Config, myIP string) (*SssMemVaultServer, error) {
+func NewSssMemVaultServer(s *store.InMemoryStore, cfg *config.Config, myName string) (*SssMemVaultServer, error) {
 	if s == nil {
 		return nil, errors.New("store cannot be nil")
 	}
@@ -40,13 +37,13 @@ func NewSssMemVaultServer(s *store.InMemoryStore, cfg *config.Config, myIP strin
 	if cfg.PrivKeyDecrypter == nil {
 		return nil, errors.New("config is missing private key decrypter")
 	}
-	if myIP == "" {
-		return nil, errors.New("myIP cannot be empty")
+	if myName == "" {
+		return nil, errors.New("myName cannot be empty")
 	}
 	return &SssMemVaultServer{
-		store:  s,
-		cfg:    cfg,
-		nodeIP: myIP,
+		store:    s,
+		cfg:      cfg,
+		nodeName: myName,
 	}, nil
 }
 
@@ -61,52 +58,46 @@ func AuthInterceptor(cfg *config.Config) grpc.UnaryServerInterceptor {
 			return handler(ctx, req)
 		}
 
-		// --- Proceed with standard peer authentication for other methods ---
-		slog.Debug("AuthInterceptor: performing peer authentication", "method", info.FullMethod)
+		// --- Proceed with standard node name authentication for other methods ---
+		slog.Debug("AuthInterceptor: performing node name authentication", "method", info.FullMethod)
 
-		// 1. Extract Peer IP
-		p, ok := peer.FromContext(ctx)
-		if !ok {
-			slog.Error("AuthInterceptor: failed to get peer from context", "method", info.FullMethod)
-			return nil, status.Error(codes.Internal, "Failed to identify peer")
-		}
-		peerIP, err := auth.GetPeerIP(p)
-		if err != nil {
-			slog.Error("AuthInterceptor: failed to extract peer IP", "peer_addr", p.Addr, "err", err)
-			return nil, status.Errorf(codes.Internal, "Failed to extract peer IP: %v", err)
-		}
-		slog.Debug("AuthInterceptor: extracted peer IP", "peer_ip", peerIP)
-
-		// 2. Extract Metadata
+		// 1. Extract Metadata
 		md, ok := metadata.FromIncomingContext(ctx)
 		if !ok {
-			slog.Warn("AuthInterceptor: missing metadata from context", "peer_ip", peerIP, "method", info.FullMethod)
+			slog.Warn("AuthInterceptor: missing metadata from context", "method", info.FullMethod)
 			return nil, status.Error(codes.Unauthenticated, "Missing authentication metadata")
 		}
 
+		// 2. Extract Node Name, Timestamp, and Signature
+		nodeNames := md.Get(auth.GRPCMetadataNodeNameKey)
 		timestamps := md.Get(auth.GRPCMetadataTimestampKey)
 		signatures := md.Get(auth.GRPCMetadataSignatureKey)
 
-		if len(timestamps) == 0 || len(signatures) == 0 {
-			slog.Warn("AuthInterceptor: missing timestamp or signature header", "peer_ip", peerIP, "method", info.FullMethod, "timestamps_count", len(timestamps), "signatures_count", len(signatures))
-			return nil, status.Errorf(codes.Unauthenticated, "Missing %s or %s header", auth.GRPCMetadataTimestampKey, auth.GRPCMetadataSignatureKey)
+		if len(nodeNames) == 0 || len(timestamps) == 0 || len(signatures) == 0 {
+			slog.Warn("AuthInterceptor: missing required headers", "method", info.FullMethod,
+				"name_hdr", auth.GRPCMetadataNodeNameKey, "name_count", len(nodeNames),
+				"ts_hdr", auth.GRPCMetadataTimestampKey, "ts_count", len(timestamps),
+				"sig_hdr", auth.GRPCMetadataSignatureKey, "sig_count", len(signatures))
+			return nil, status.Errorf(codes.Unauthenticated, "Missing %s, %s, or %s header",
+				auth.GRPCMetadataNodeNameKey, auth.GRPCMetadataTimestampKey, auth.GRPCMetadataSignatureKey)
 		}
 		// Use only the first value if multiple are sent
+		requestingNodeName := nodeNames[0]
 		timestampStr := timestamps[0]
 		signatureB64 := signatures[0]
 
-		// 3. Verify Request
-		err = auth.VerifyRequest(peerIP, timestampStr, signatureB64, cfg)
+		// 3. Verify Request using Node Name
+		err := auth.VerifyRequest(requestingNodeName, timestampStr, signatureB64, cfg)
 		if err != nil {
-			slog.Warn("AuthInterceptor: request verification failed", "peer_ip", peerIP, "method", info.FullMethod, "err", err)
+			slog.Warn("AuthInterceptor: request verification failed", "node_name", requestingNodeName, "method", info.FullMethod, "err", err)
 			// Return Unauthenticated for security reasons, even if the underlying issue was different (e.g., unknown peer)
 			return nil, status.Errorf(codes.Unauthenticated, "Request authentication failed: %v", err)
 		}
 
-		slog.Debug("AuthInterceptor: authentication successful", "peer_ip", peerIP, "method", info.FullMethod)
+		slog.Debug("AuthInterceptor: authentication successful", "node_name", requestingNodeName, "method", info.FullMethod)
 
-		// Add authenticated peer IP to context for handlers? Maybe not needed if handlers re-extract.
-		// ctx = context.WithValue(ctx, "authenticatedPeerIP", peerIP)
+		// Add authenticated node name to context for handlers
+		ctx = context.WithValue(ctx, auth.GRPCMetadataNodeNameKey, requestingNodeName)
 
 		// 4. Proceed to the handler
 		return handler(ctx, req)
@@ -160,18 +151,15 @@ func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecode
 		return nil, status.Error(codes.InvalidArgument, "Key and timestamp are required")
 	}
 
-	// 1. Get Peer IP (already authenticated by interceptor, but needed for reader check)
-	p, ok := peer.FromContext(ctx)
-	if !ok {
-		slog.Error("GetDecoded: failed to get peer from context")
-		return nil, status.Error(codes.Internal, "Failed to identify peer")
+	// 1. Get Requesting Node Name (from context set by interceptor)
+	requestingNodeNameVal := ctx.Value(auth.GRPCMetadataNodeNameKey)
+	requestingNodeName, ok := requestingNodeNameVal.(string)
+	if !ok || requestingNodeName == "" {
+		// This should not happen if the interceptor ran correctly
+		slog.Error("GetDecoded: failed to get authenticated node name from context")
+		return nil, status.Error(codes.Internal, "Failed to identify requesting node")
 	}
-	requestingPeerIP, err := auth.GetPeerIP(p)
-	if err != nil {
-		slog.Error("GetDecoded: failed to extract peer IP", "peer_addr", p.Addr, "err", err)
-		return nil, status.Errorf(codes.Internal, "Failed to extract peer IP: %v", err)
-	}
-	slog.Debug("GetDecoded: requesting peer", "ip", requestingPeerIP)
+	slog.Debug("GetDecoded: requesting node", "name", requestingNodeName)
 
 	// 2. Get the requested entry from the store
 	entry, err := self.store.GetEntry(req.Key, req.Timestamp)
@@ -180,19 +168,19 @@ func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecode
 		return nil, status.Errorf(codes.NotFound, "Entry not found or timestamp mismatch for key %q: %v", req.Key, err)
 	}
 
-	// 3. Check if the requesting peer is in the readers list
+	// 3. Check if the requesting node name is in the readers list
 	// Requires Go 1.21+ for slices.Contains
-	if !slices.Contains(entry.Readers, requestingPeerIP) {
-		slog.Warn("GetDecoded permission denied: requesting peer not in readers list",
+	if !slices.Contains(entry.Readers, requestingNodeName) {
+		slog.Warn("GetDecoded permission denied: requesting node not in readers list",
 			"key", req.Key,
-			"requesting_peer_ip", requestingPeerIP,
+			"requesting_node_name", requestingNodeName,
 			"readers", entry.Readers)
-		return nil, status.Errorf(codes.PermissionDenied, "Peer %s is not authorized to read key %q", requestingPeerIP, req.Key)
+		return nil, status.Errorf(codes.PermissionDenied, "Node %q is not authorized to read key %q", requestingNodeName, req.Key)
 	}
-	slog.Debug("GetDecoded: reader authorized", "key", req.Key, "reader_ip", requestingPeerIP)
+	slog.Debug("GetDecoded: reader authorized", "key", req.Key, "reader_name", requestingNodeName)
 
 	// 4. Find the encrypted fragment(s) belonging to *this* node (the one handling the request)
-	fragmentList, ok := entry.OwnerFragments[self.nodeIP]
+	fragmentList, ok := entry.OwnerFragments[self.nodeName]
 	if !ok || fragmentList == nil || len(fragmentList.Fragments) == 0 {
 		// This means the entry exists, the reader is valid, but this specific node
 		// doesn't own a fragment for this entry, or the list is empty. This shouldn't typically happen
@@ -200,11 +188,11 @@ func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecode
 		slog.Error("GetDecoded failed: this node does not own a fragment list for the requested entry",
 			"key", req.Key,
 			"timestamp", req.Timestamp.AsTime(),
-			"node_ip", self.nodeIP,
-			"owner_ips", maps.Keys(entry.OwnerFragments)) // Requires Go 1.21+ for maps.Keys
-		return nil, status.Errorf(codes.NotFound, "This node (%s) does not hold a fragment list for key %q", self.nodeIP, req.Key)
+			"node_name", self.nodeName,
+			"owner_names", maps.Keys(entry.OwnerFragments)) // Requires Go 1.21+ for maps.Keys
+		return nil, status.Errorf(codes.NotFound, "This node (%s) does not hold a fragment list for key %q", self.nodeName, req.Key)
 	}
-	slog.Debug("GetDecoded: found encrypted fragment list for this node", "key", req.Key, "node_ip", self.nodeIP, "fragment_count", len(fragmentList.Fragments))
+	slog.Debug("GetDecoded: found encrypted fragment list for this node", "key", req.Key, "node_name", self.nodeName, "fragment_count", len(fragmentList.Fragments))
 
 	// 5. Decrypt *all* fragments owned by this node
 	decryptedFragments := make([][]byte, 0, len(fragmentList.Fragments))
@@ -216,7 +204,7 @@ func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecode
 			slog.Error("GetDecoded failed: could not decrypt one of the owned fragments",
 				"key", req.Key,
 				"timestamp", req.Timestamp.AsTime(),
-				"node_ip", self.nodeIP,
+				"node_name", self.nodeName,
 				"fragment_index", i,
 				"err", err)
 			// Decide on behavior: return error immediately or try to return partial results?
@@ -224,20 +212,20 @@ func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecode
 			return nil, status.Errorf(codes.Internal, "Failed to decrypt owned fragment %d for key %q: %v", i, req.Key, err)
 		}
 		decryptedFragments = append(decryptedFragments, decFrag)
-		slog.Debug("GetDecoded: successfully decrypted owned fragment", "key", req.Key, "node_ip", self.nodeIP, "fragment_index", i)
+		slog.Debug("GetDecoded: successfully decrypted owned fragment", "key", req.Key, "node_name", self.nodeName, "fragment_index", i)
 	}
 
-	// 6. Find the requesting peer's hybrid public key
-	requestorPeerCfg, ok := self.cfg.LoadedPeers[requestingPeerIP]
+	// 6. Find the requesting node's hybrid public key (using its name)
+	requestorPeerCfg, ok := self.cfg.LoadedPeers[requestingNodeName]
 	if !ok || requestorPeerCfg.PubKeyEncrypter == nil {
-		slog.Error("GetDecoded failed: could not find hybrid public key for requesting peer",
+		slog.Error("GetDecoded failed: could not find hybrid public key for requesting node",
 			"key", req.Key,
-			"requesting_peer_ip", requestingPeerIP)
+			"requesting_node_name", requestingNodeName)
 		// This indicates a configuration issue on the server side.
-		return nil, status.Errorf(codes.Internal, "Configuration error: missing hybrid public key for peer %s", requestingPeerIP)
+		return nil, status.Errorf(codes.Internal, "Configuration error: missing hybrid public key for peer %s", requestingNodeName)
 	}
 	requestorEncrypter := requestorPeerCfg.PubKeyEncrypter
-	slog.Debug("GetDecoded: found hybrid public key for requestor", "key", req.Key, "requesting_peer_ip", requestingPeerIP)
+	slog.Debug("GetDecoded: found hybrid public key for requestor", "key", req.Key, "requesting_node_name", requestingNodeName)
 
 	// 7. Re-encrypt *all* decrypted fragments using the requestor's public key
 	fragmentsForRequestor := make([][]byte, 0, len(decryptedFragments))
@@ -246,20 +234,20 @@ func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecode
 		if err != nil {
 			slog.Error("GetDecoded failed: could not re-encrypt fragment for requestor",
 				"key", req.Key,
-				"requesting_peer_ip", requestingPeerIP,
+				"requesting_node_name", requestingNodeName,
 				"fragment_index", i,
 				"err", err)
-			return nil, status.Errorf(codes.Internal, "Failed to re-encrypt fragment %d for requestor %s: %v", i, requestingPeerIP, err)
+			return nil, status.Errorf(codes.Internal, "Failed to re-encrypt fragment %d for requestor %s: %v", i, requestingNodeName, err)
 		}
 		fragmentsForRequestor = append(fragmentsForRequestor, encFrag)
-		slog.Debug("GetDecoded: successfully re-encrypted fragment for requestor", "key", req.Key, "requesting_peer_ip", requestingPeerIP, "fragment_index", i)
+		slog.Debug("GetDecoded: successfully re-encrypted fragment for requestor", "key", req.Key, "requesting_node_name", requestingNodeName, "fragment_index", i)
 	}
 
 	// 8. Return the list of re-encrypted fragments
 	resp := &pb.GetDecodedResponse{
 		EncryptedFragments: fragmentsForRequestor, // Use the correct field name
 	}
-	slog.Info("GetDecoded request successful", "key", req.Key, "timestamp", req.Timestamp.AsTime(), "requesting_peer_ip", requestingPeerIP, "fragment_count", len(fragmentsForRequestor))
+	slog.Info("GetDecoded request successful", "key", req.Key, "timestamp", req.Timestamp.AsTime(), "requesting_node_name", requestingNodeName, "fragment_count", len(fragmentsForRequestor))
 	return resp, nil
 }
 

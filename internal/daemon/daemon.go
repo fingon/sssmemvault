@@ -23,8 +23,8 @@ import (
 // Config holds the specific configuration needed for the daemon subcommand.
 type Config struct {
 	ConfigPath string `kong:"name='config',short='c',default='config.yaml',help='Path to the configuration file.'"`
-	MyIP       string `kong:"name='my-ip',required,help='This node\\'s externally reachable IP address.'"`
-	// LogLevel is handled globally now
+	MyName     string `kong:"name='my-name',required,help='This node\\'s unique name (must match a key in config peers).'"`
+	// LogLevel is handled globally
 }
 
 // Run starts the sssmemvault daemon.
@@ -56,23 +56,30 @@ func Run(cfg *Config) int {
 	var wgConnect sync.WaitGroup
 	var mu sync.Mutex // Protect peerNodes map during concurrent connections
 
-	for ip, peerCfg := range appCfg.Peers {
+	for name, peerCfgPtr := range appCfg.LoadedPeers { // Iterate over LoadedPeers which has pointers
 		// Avoid capturing loop variables directly in goroutine
-		localIP := ip
-		localPeerCfg := peerCfg // Get a pointer to the config from the map
+		localName := name
+		localPeerCfgPtr := peerCfgPtr // Capture the pointer for this iteration
+
+		// Skip connecting to self if 'my-name' is in the peers list
+		if localName == cfg.MyName {
+			slog.Debug("Skipping connection to self", "name", localName)
+			continue
+		}
+
+		// Skip peers without an endpoint (likely client entries)
+		if localPeerCfgPtr.Endpoint == "" {
+			slog.Debug("Skipping connection to peer without endpoint", "name", localName)
+			continue
+		}
 
 		wgConnect.Add(1)
 		go func() {
 			defer wgConnect.Done()
-			// Connect synchronously for simplicity, could be done concurrently
-			peerNode, err := node.ConnectToPeer(connectCtx, localIP, &localPeerCfg) // Pass connectCtx
-			if err != nil {
-				// Log error but continue, maybe the peer will come online later
-				slog.Error("Failed to connect to peer", "peer_ip", localIP, "endpoint", localPeerCfg.Endpoint, "err", err)
-				// Optionally: Implement retry logic here or in the synchronizer
-			} else {
+			peerNode, err := node.ConnectToPeer(connectCtx, localName, localPeerCfgPtr) // Pass connectCtx and pointer
+			if err == nil {
 				mu.Lock()
-				peerNodes[localIP] = peerNode
+				peerNodes[localName] = peerNode
 				mu.Unlock()
 				// Defer closing connections on shutdown (handled later)
 			}
@@ -83,11 +90,11 @@ func Run(cfg *Config) int {
 	// Defer closing connections
 	defer func() {
 		slog.Info("Closing peer connections...")
-		for _, pn := range peerNodes {
+		for name, pn := range peerNodes {
 			if pn != nil {
 				err := pn.Close()
 				if err != nil {
-					slog.Warn("Error closing connection to peer", "peer_ip", pn.IP, "err", err)
+					slog.Warn("Error closing connection to peer", "peer_name", name, "err", err)
 				}
 			}
 		}
@@ -96,8 +103,8 @@ func Run(cfg *Config) int {
 	slog.Info("Attempted connections to all configured peers", "connected_count", len(peerNodes), "config_count", len(appCfg.Peers))
 
 	// --- Initialize Synchronizer ---
-	// Pass the map of successfully connected peers
-	syncr, err := synchronizer.NewSynchronizer(appCfg, localStore, peerNodes)
+	// Pass the map of successfully connected peers and own name
+	syncr, err := synchronizer.NewSynchronizer(appCfg, localStore, peerNodes, cfg.MyName)
 	if err != nil {
 		slog.Error("Failed to initialize synchronizer", "err", err)
 		return 1 // Synchronizer is critical
@@ -119,7 +126,7 @@ func Run(cfg *Config) int {
 	)
 
 	// Create and register the service implementation
-	sssServer, err := server.NewSssMemVaultServer(localStore, appCfg, cfg.MyIP) // Pass MyIP from daemon config
+	sssServer, err := server.NewSssMemVaultServer(localStore, appCfg, cfg.MyName) // Pass MyName from daemon config
 	if err != nil {
 		slog.Error("Failed to create SSS MemVault server implementation", "err", err)
 		_ = lis.Close() // Clean up listener

@@ -72,8 +72,8 @@ type Entry struct {
 	state          protoimpl.MessageState   `protogen:"open.v1"`
 	Timestamp      *timestamppb.Timestamp   `protobuf:"bytes,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	Key            string                   `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
-	Readers        []string                 `protobuf:"bytes,3,rep,name=readers,proto3" json:"readers,omitempty"`                                                                                                               // List of IPs allowed to get decoded fragments
-	OwnerFragments map[string]*FragmentList `protobuf:"bytes,4,rep,name=owner_fragments,json=ownerFragments,proto3" json:"owner_fragments,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Map: Owner IP -> List of Encrypted SSS Fragments
+	Readers        []string                 `protobuf:"bytes,3,rep,name=readers,proto3" json:"readers,omitempty"`                                                                                                               // List of node names allowed to get decoded fragments
+	OwnerFragments map[string]*FragmentList `protobuf:"bytes,4,rep,name=owner_fragments,json=ownerFragments,proto3" json:"owner_fragments,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Map: Owner Name -> List of Encrypted SSS Fragments
 	Threshold      int32                    `protobuf:"varint,5,opt,name=threshold,proto3" json:"threshold,omitempty"`                                                                                                          // Number of fragments required to reconstruct the secret
 	Signature      []byte                   `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`                                                                                                           // Master public key signature over the entry data (excluding this field)
 	unknownFields  protoimpl.UnknownFields

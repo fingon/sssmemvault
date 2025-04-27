@@ -28,8 +28,8 @@ message FragmentList {
 message Entry {
   google.protobuf.Timestamp timestamp = 1;
   string key = 2;
-  repeated string readers = 3; // List of IPs allowed to get decoded fragments
-  map<string, FragmentList> owner_fragments = 4; // Map: Owner IP -> List of Encrypted SSS Fragments
+  repeated string readers = 3; // List of node names allowed to get decoded fragments
+  map<string, FragmentList> owner_fragments = 4; // Map: Owner Name -> List of Encrypted SSS Fragments
   int32 threshold = 5; // Number of fragments required to reconstruct the secret
   bytes signature = 6; // Master public key signature over the entry data (excluding this field)
 }
