@@ -20,30 +20,30 @@ const (
 
 // PeerConfig holds configuration for a single peer node.
 type PeerConfig struct {
-	Endpoint     string         `yaml:"endpoint"`                // e.g., "192.168.1.101:59240"
-	PublicKey    string         `yaml:"public_key"`              // Path to peer's public key file
-	PollInterval *time.Duration `yaml:"poll_interval,omitempty"` // Optional polling frequency (Go duration string)
-	// Optional: List of CIDRs allowed to connect using this peer's key. e.g., ["192.168.1.101/32", "2001:db8::/64"]
-	AllowedSourceCIDRs []string `yaml:"allowed_source_cidrs,omitempty"`
+	Endpoint           string         `yaml:"endpoint"`                       // e.g., "192.168.1.101:59240"
+	SigningPublicKey   string         `yaml:"signing_public_key"`             // Path to peer's public key file for signature verification
+	HybridPublicKey    string         `yaml:"hybrid_public_key"`              // Path to peer's public key file for hybrid encryption
+	PollInterval       *time.Duration `yaml:"poll_interval,omitempty"`        // Optional polling frequency (Go duration string)
+	AllowedSourceCIDRs []string       `yaml:"allowed_source_cidrs,omitempty"` // Optional: List of CIDRs allowed to connect using this peer's signing key.
 
 	// Internal fields populated after loading
-	PubKeyVerifier  tink.Verifier      `yaml:"-"` // Tink public key verifier
-	PubKeyEncrypter tink.HybridEncrypt `yaml:"-"` // Tink public key encrypter (needed for provisioning tool, maybe not server)
+	PubKeyVerifier  tink.Verifier      `yaml:"-"` // Tink public key verifier (from signing_public_key)
+	PubKeyEncrypter tink.HybridEncrypt `yaml:"-"` // Tink public key encrypter (from hybrid_public_key)
 }
 
 // Config holds the application's configuration.
 type Config struct {
-	PrivateKeyPath   string                `yaml:"private_key_path"`   // Path to this node's private key file
-	MasterPublicKey  string                `yaml:"master_public_key"`  // Path to master public key file
-	ListenAddress    string                `yaml:"listen_address"`     // e.g., ":59240"
-	Peers            map[string]PeerConfig `yaml:"peers"`              // Map: Peer IP -> PeerConfig
-	MaxTimestampSkew time.Duration         `yaml:"max_timestamp_skew"` // e.g., 30s
-	// MyIP             string                `yaml:"my_ip"` // Removed: Provided via CLI flag now
+	SigningPrivateKeyPath  string                `yaml:"signing_private_key_path"`  // Path to this node's private key file for signing requests
+	HybridPrivateKeyPath   string                `yaml:"hybrid_private_key_path"`   // Path to this node's private key file for decrypting fragments
+	MasterSigningPublicKey string                `yaml:"master_signing_public_key"` // Path to master public key file for verifying entry signatures
+	ListenAddress          string                `yaml:"listen_address"`            // e.g., ":59240"
+	Peers                  map[string]PeerConfig `yaml:"peers"`                     // Map: Peer IP -> PeerConfig
+	MaxTimestampSkew       time.Duration         `yaml:"max_timestamp_skew"`        // e.g., 30s
 
 	// Internal fields populated after loading
-	PrivKeySigner    tink.Signer            `yaml:"-"` // Tink private key signer
-	PrivKeyDecrypter tink.HybridDecrypt     `yaml:"-"` // Tink private key decrypter
-	MasterPubKey     tink.Verifier          `yaml:"-"` // Tink master public key verifier
+	PrivKeySigner    tink.Signer            `yaml:"-"` // Tink private key signer (from signing_private_key_path)
+	PrivKeyDecrypter tink.HybridDecrypt     `yaml:"-"` // Tink private key decrypter (from hybrid_private_key_path)
+	MasterPubKey     tink.Verifier          `yaml:"-"` // Tink master public key verifier (from master_signing_public_key)
 	LoadedPeers      map[string]*PeerConfig `yaml:"-"` // Processed peers with loaded keys (map key is IP)
 }
 
@@ -64,29 +64,38 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	// --- Validation ---
-	if cfg.PrivateKeyPath == "" {
-		return nil, errors.New("config validation failed: private_key_path is required")
+	if cfg.SigningPrivateKeyPath == "" {
+		return nil, errors.New("config validation failed: signing_private_key_path is required")
 	}
-	if cfg.MasterPublicKey == "" {
-		return nil, errors.New("config validation failed: master_public_key is required")
+	if cfg.HybridPrivateKeyPath == "" {
+		return nil, errors.New("config validation failed: hybrid_private_key_path is required")
 	}
-	// my_ip validation removed, provided via CLI flag
+	if cfg.MasterSigningPublicKey == "" {
+		return nil, errors.New("config validation failed: master_signing_public_key is required")
+	}
 	if cfg.MaxTimestampSkew <= 0 {
 		return nil, errors.New("config validation failed: max_timestamp_skew must be positive")
 	}
 
-	// --- Load Keys ---
-	cfg.PrivKeySigner, cfg.PrivKeyDecrypter, err = crypto.LoadPrivateKey(cfg.PrivateKeyPath)
+	// --- Load Own Keys ---
+	cfg.PrivKeySigner, err = crypto.LoadPrivateKeySigner(cfg.SigningPrivateKeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load own private key: %w", err)
+		return nil, fmt.Errorf("failed to load own signing private key: %w", err)
 	}
-	slog.Info("Loaded own private key", "path", cfg.PrivateKeyPath)
+	slog.Info("Loaded own signing private key", "path", cfg.SigningPrivateKeyPath)
 
-	cfg.MasterPubKey, err = crypto.LoadPublicKeyVerifier(cfg.MasterPublicKey)
+	cfg.PrivKeyDecrypter, err = crypto.LoadPrivateKeyDecrypter(cfg.HybridPrivateKeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load master public key: %w", err)
+		return nil, fmt.Errorf("failed to load own hybrid private key: %w", err)
 	}
-	slog.Info("Loaded master public key", "path", cfg.MasterPublicKey)
+	slog.Info("Loaded own hybrid private key", "path", cfg.HybridPrivateKeyPath)
+
+	// --- Load Master Key ---
+	cfg.MasterPubKey, err = crypto.LoadPublicKeyVerifier(cfg.MasterSigningPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load master signing public key: %w", err)
+	}
+	slog.Info("Loaded master signing public key", "path", cfg.MasterSigningPublicKey)
 
 	// --- Load Peer Keys ---
 	// Create a mutable copy to store loaded keys back into
@@ -96,25 +105,37 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	for ip, peerCfg := range cfg.Peers {
-		if peerCfg.PublicKey == "" {
-			return nil, fmt.Errorf("config validation failed: public_key is required for peer %q", ip)
+		if peerCfg.SigningPublicKey == "" {
+			return nil, fmt.Errorf("config validation failed: signing_public_key is required for peer %q", ip)
+		}
+		if peerCfg.HybridPublicKey == "" {
+			return nil, fmt.Errorf("config validation failed: hybrid_public_key is required for peer %q", ip)
 		}
 		if peerCfg.Endpoint == "" {
-			return nil, fmt.Errorf("config validation failed: endpoint is required for peer %q", ip)
+			// Allow empty endpoint for client-only entries in config used by 'get'/'push'
+			slog.Debug("Peer config has empty endpoint, assuming client-only entry", "peer_ip", ip)
+			// return nil, fmt.Errorf("config validation failed: endpoint is required for peer %q", ip)
 		}
 
-		verifier, encrypter, err := crypto.LoadPublicKey(peerCfg.PublicKey)
+		// Load Signing Public Key (Verifier)
+		verifier, err := crypto.LoadPublicKeyVerifier(peerCfg.SigningPublicKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load public key for peer %q: %w", ip, err)
+			return nil, fmt.Errorf("failed to load signing public key for peer %q: %w", ip, err)
 		}
+		slog.Info("Loaded peer signing public key", "peer_ip", ip, "path", peerCfg.SigningPublicKey)
+
+		// Load Hybrid Public Key (Encrypter)
+		encrypter, err := crypto.LoadPublicKeyEncrypter(peerCfg.HybridPublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load hybrid public key for peer %q: %w", ip, err)
+		}
+		slog.Info("Loaded peer hybrid public key", "peer_ip", ip, "path", peerCfg.HybridPublicKey)
 
 		// Store the loaded keys back into the temporary map
 		loadedPeer := loadedPeers[ip] // Get the struct copy from the cloned map
 		loadedPeer.PubKeyVerifier = verifier
 		loadedPeer.PubKeyEncrypter = encrypter
 		loadedPeers[ip] = loadedPeer // Put the updated struct back
-
-		slog.Info("Loaded peer public key", "peer_ip", ip, "path", peerCfg.PublicKey)
 	}
 	// Assign the map with loaded keys back to the config
 	cfg.LoadedPeers = make(map[string]*PeerConfig, len(loadedPeers))
@@ -146,35 +167,45 @@ func LoadConfigIgnoreOwnKey(path string) (*Config, error) {
 	}
 
 	// --- Validation ---
-	// Skip private_key_path validation
-	if cfg.MasterPublicKey == "" {
-		return nil, errors.New("config validation failed: master_public_key is required")
+	// Skip own private key path validation for client tools
+	if cfg.MasterSigningPublicKey == "" {
+		return nil, errors.New("config validation failed: master_signing_public_key is required")
 	}
 	if cfg.MaxTimestampSkew <= 0 {
 		return nil, errors.New("config validation failed: max_timestamp_skew must be positive")
 	}
 
-	// --- Load Keys (Ignoring Own Private Key) ---
-	// Attempt to load own private key, but log warning instead of failing on error
-	if cfg.PrivateKeyPath != "" {
-		_, _, err = crypto.LoadPrivateKey(cfg.PrivateKeyPath)
+	// --- Load Keys (Ignoring Own Private Keys) ---
+	// Attempt to load own keys, but log warning instead of failing on error
+	if cfg.SigningPrivateKeyPath != "" {
+		_, err = crypto.LoadPrivateKeySigner(cfg.SigningPrivateKeyPath)
 		if err != nil {
-			slog.Warn("Ignoring error while loading own private key specified in config", "path", cfg.PrivateKeyPath, "err", err)
-			// Clear the potentially loaded (but maybe partial) keys if error occurred
+			slog.Warn("Ignoring error while loading own signing private key specified in config", "path", cfg.SigningPrivateKeyPath, "err", err)
 			cfg.PrivKeySigner = nil
-			cfg.PrivKeyDecrypter = nil
 		} else {
-			slog.Debug("Loaded own private key specified in config (likely unused by client)", "path", cfg.PrivateKeyPath)
+			slog.Debug("Loaded own signing private key specified in config (likely unused by client)", "path", cfg.SigningPrivateKeyPath)
 		}
 	} else {
-		slog.Debug("Own private_key_path not specified in config, skipping load.")
+		slog.Debug("Own signing_private_key_path not specified in config, skipping load.")
+	}
+	if cfg.HybridPrivateKeyPath != "" {
+		_, err = crypto.LoadPrivateKeyDecrypter(cfg.HybridPrivateKeyPath)
+		if err != nil {
+			slog.Warn("Ignoring error while loading own hybrid private key specified in config", "path", cfg.HybridPrivateKeyPath, "err", err)
+			cfg.PrivKeyDecrypter = nil
+		} else {
+			slog.Debug("Loaded own hybrid private key specified in config (likely unused by client)", "path", cfg.HybridPrivateKeyPath)
+		}
+	} else {
+		slog.Debug("Own hybrid_private_key_path not specified in config, skipping load.")
 	}
 
-	cfg.MasterPubKey, err = crypto.LoadPublicKeyVerifier(cfg.MasterPublicKey)
+	// --- Load Master Key ---
+	cfg.MasterPubKey, err = crypto.LoadPublicKeyVerifier(cfg.MasterSigningPublicKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load master public key: %w", err)
+		return nil, fmt.Errorf("failed to load master signing public key: %w", err)
 	}
-	slog.Info("Loaded master public key", "path", cfg.MasterPublicKey)
+	slog.Info("Loaded master signing public key", "path", cfg.MasterSigningPublicKey)
 
 	// --- Load Peer Keys ---
 	loadedPeers := maps.Clone(cfg.Peers)
@@ -183,24 +214,36 @@ func LoadConfigIgnoreOwnKey(path string) (*Config, error) {
 	}
 
 	for ip, peerCfg := range cfg.Peers {
-		if peerCfg.PublicKey == "" {
-			return nil, fmt.Errorf("config validation failed: public_key is required for peer %q", ip)
+		if peerCfg.SigningPublicKey == "" {
+			return nil, fmt.Errorf("config validation failed: signing_public_key is required for peer %q", ip)
+		}
+		if peerCfg.HybridPublicKey == "" {
+			return nil, fmt.Errorf("config validation failed: hybrid_public_key is required for peer %q", ip)
 		}
 		if peerCfg.Endpoint == "" {
-			return nil, fmt.Errorf("config validation failed: endpoint is required for peer %q", ip)
+			// Allow empty endpoint for client-only entries in config used by 'get'/'push'
+			slog.Debug("Peer config has empty endpoint, assuming client-only entry", "peer_ip", ip)
 		}
 
-		verifier, encrypter, err := crypto.LoadPublicKey(peerCfg.PublicKey)
+		// Load Signing Public Key (Verifier)
+		verifier, err := crypto.LoadPublicKeyVerifier(peerCfg.SigningPublicKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load public key for peer %q: %w", ip, err)
+			return nil, fmt.Errorf("failed to load signing public key for peer %q: %w", ip, err)
 		}
+		slog.Info("Loaded peer signing public key", "peer_ip", ip, "path", peerCfg.SigningPublicKey)
 
+		// Load Hybrid Public Key (Encrypter)
+		encrypter, err := crypto.LoadPublicKeyEncrypter(peerCfg.HybridPublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load hybrid public key for peer %q: %w", ip, err)
+		}
+		slog.Info("Loaded peer hybrid public key", "peer_ip", ip, "path", peerCfg.HybridPublicKey)
+
+		// Store the loaded keys back into the temporary map
 		loadedPeer := loadedPeers[ip]
 		loadedPeer.PubKeyVerifier = verifier
 		loadedPeer.PubKeyEncrypter = encrypter
 		loadedPeers[ip] = loadedPeer
-
-		slog.Info("Loaded peer public key", "peer_ip", ip, "path", peerCfg.PublicKey)
 	}
 
 	cfg.LoadedPeers = make(map[string]*PeerConfig, len(loadedPeers))

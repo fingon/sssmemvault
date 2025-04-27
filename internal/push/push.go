@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,35 +18,61 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// OwnerInfo holds the IP and public key path for an owner node.
-// Duplicated from old main, consider moving to a shared internal type if needed elsewhere.
+// OwnerInfo holds the IP, hybrid public key path, and desired fragment count for an owner node.
 type OwnerInfo struct {
-	IP        string
-	PublicKey string
+	IP              string
+	HybridPublicKey string // Path to the public key used for encrypting fragments
+	Count           int    // Number of fragments this owner should receive
 }
 
 // Config holds the specific configuration needed for the push subcommand.
 type Config struct {
-	MasterPrivateKey string   `kong:"name='master-key',required,help='Path to the master private key JSON file (for signing).'"`
-	Owners           []string `kong:"name='owner',optional,help='Owner node info as IP=PublicKeyPath (e.g., 192.168.1.1=owner1_pub.json). Repeat for each owner. Can be sourced from --config.'"`
-	Readers          []string `kong:"name='reader',required,help='IP address of a node allowed to read the secret. Repeat for each reader.'"`
-	Key              string   `kong:"name='key',required,help='The key name for the secret.'"`
-	Secret           string   `kong:"name='secret',required,help='The secret value to store.'"`
-	Threshold        int      `kong:"name='threshold',short='t',required,help='Shamir threshold (number of fragments needed to reconstruct).'"`
-	Parts            int      `kong:"name='parts',short='p',required,help='Total number of Shamir fragments to create (must match number of owners).'"`
-	Targets          []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
-	ConfigPath       string   `kong:"name='config',optional,help='Path to a configuration file to load parameters from (owners, targets).'"`
+	MasterSigningPrivateKey string   `kong:"name='master-signing-key',required,help='Path to the master private key JSON file (for signing entries).'"`
+	Owners                  []string `kong:"name='owner',optional,help='Owner node info as IP=HybridPublicKeyPath:Count (e.g., 192.168.1.1=owner1_hybrid_pub.json:2). Repeat for each owner. Total count must match --parts. Can be sourced from --config (count defaults to 1 if format is IP=Path).'"`
+	Readers                 []string `kong:"name='reader',required,help='IP address of a node allowed to read the secret. Repeat for each reader.'"`
+	Key                     string   `kong:"name='key',required,help='The key name for the secret.'"`
+	Secret                  string   `kong:"name='secret',required,help='The secret value to store.'"`
+	Threshold               int      `kong:"name='threshold',short='t',required,help='Shamir threshold (number of fragments needed to reconstruct).'"`
+	Parts                   int      `kong:"name='parts',short='p',required,help='Total number of Shamir fragments to create (must match number of owners).'"`
+	Targets                 []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
+	ConfigPath              string   `kong:"name='config',optional,help='Path to a configuration file to load parameters from (owners, targets).'"`
 	// LogLevel is handled globally
 }
 
-// parseOwner parses the IP=PublicKeyPath string.
+// parseOwner parses the IP=HybridPublicKeyPath[:Count] string. Count defaults to 1 if omitted.
 func parseOwner(ownerStr string) (*OwnerInfo, error) {
 	parts := strings.SplitN(ownerStr, "=", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return nil, fmt.Errorf("invalid owner format, expected IP=PublicKeyPath, got %q", ownerStr)
+		return nil, fmt.Errorf("invalid owner format, expected IP=HybridPublicKeyPath[:Count], got %q", ownerStr)
 	}
+	ip := parts[0]
+	pathAndCount := parts[1]
+
+	var path string
+	var countStr string
+	count := 1 // Default count
+
+	// Check if count is provided
+	countParts := strings.SplitN(pathAndCount, ":", 2)
+	if len(countParts) == 2 {
+		path = countParts[0]
+		countStr = countParts[1]
+		parsedCount, err := strconv.Atoi(countStr)
+		if err != nil || parsedCount <= 0 {
+			return nil, fmt.Errorf("invalid count %q for owner %q: must be a positive integer", countStr, ip)
+		}
+		count = parsedCount
+	} else {
+		// No count provided, use default
+		path = pathAndCount
+	}
+
+	if path == "" {
+		return nil, fmt.Errorf("invalid owner format, missing public key path for IP %q in %q", ip, ownerStr)
+	}
+
 	// Basic IP validation could be added here if needed
-	return &OwnerInfo{IP: parts[0], PublicKey: parts[1]}, nil
+	return &OwnerInfo{IP: ip, HybridPublicKey: path, Count: count}, nil
 }
 
 // loadConfigAndDeriveParams loads the configuration file if specified and updates
@@ -70,11 +97,12 @@ func loadConfigAndDeriveParams(pushCfg *Config) (*config.Config, error) {
 			return nil, errors.New("config file specified but contains no peers to use as owners")
 		}
 		for ip, peerCfg := range appCfg.Peers {
-			if peerCfg.PublicKey == "" {
+			if peerCfg.HybridPublicKey == "" {
 				// This check might be redundant if LoadConfig enforces it, but good defense.
-				return nil, fmt.Errorf("peer %q in config file is missing public_key path", ip)
+				return nil, fmt.Errorf("peer %q in config file is missing hybrid_public_key path", ip)
 			}
-			pushCfg.Owners = append(pushCfg.Owners, fmt.Sprintf("%s=%s", ip, peerCfg.PublicKey))
+			// Use the HybridPublicKey path for the owner string
+			pushCfg.Owners = append(pushCfg.Owners, fmt.Sprintf("%s=%s", ip, peerCfg.HybridPublicKey))
 		}
 		slog.Info("Using owners derived from config file", "count", len(pushCfg.Owners))
 	}
@@ -110,8 +138,13 @@ func Run(pushCfg *Config) int {
 		slog.Error("No owners specified. Provide via --owner flags or --config file.")
 		return 1
 	}
-	if pushCfg.Parts != len(pushCfg.Owners) {
-		slog.Error("Number of owners must match the number of parts", "parts", pushCfg.Parts, "owners", len(pushCfg.Owners))
+	// Allow parts != owners for round-robin distribution
+	// if pushCfg.Parts != len(pushCfg.Owners) {
+	// 	slog.Error("Number of owners must match the number of parts", "parts", pushCfg.Parts, "owners", len(pushCfg.Owners))
+	// 	return 1
+	// }
+	if pushCfg.Parts <= 0 {
+		slog.Error("Number of parts must be positive", "parts", pushCfg.Parts)
 		return 1
 	}
 	if pushCfg.Threshold > pushCfg.Parts {
@@ -131,19 +164,20 @@ func Run(pushCfg *Config) int {
 		return 1
 	}
 
-	// --- Load Master Key ---
-	slog.Debug("Loading master private key", "path", pushCfg.MasterPrivateKey)
-	masterSigner, err := crypto.LoadMasterPrivateKeySigner(pushCfg.MasterPrivateKey)
+	// --- Load Master Signing Key ---
+	slog.Debug("Loading master signing private key", "path", pushCfg.MasterSigningPrivateKey)
+	masterSigner, err := crypto.LoadMasterPrivateKeySigner(pushCfg.MasterSigningPrivateKey)
 	if err != nil {
-		slog.Error("Failed to load master private key", "path", pushCfg.MasterPrivateKey, "err", err)
+		slog.Error("Failed to load master signing private key", "path", pushCfg.MasterSigningPrivateKey, "err", err)
 		return 1
 	}
-	slog.Info("Loaded master private key successfully")
+	slog.Info("Loaded master signing private key successfully")
 
-	// --- Load Owner Public Keys (using parsed/derived owner info) ---
-	ownerKeys := make(map[string]tink.HybridEncrypt) // Map: IP -> Encrypter
+	// --- Parse Owner Info and Load Keys ---
+	ownerHybridEncrypters := make(map[string]tink.HybridEncrypt) // Map: IP -> Encrypter
 	ownerInfos := make([]*OwnerInfo, 0, len(pushCfg.Owners))
 	ownerIPSet := make(map[string]struct{}) // To check for duplicate IPs
+	totalFragmentCountSpecified := 0
 	for _, ownerStr := range pushCfg.Owners {
 		ownerInfo, err := parseOwner(ownerStr)
 		if err != nil {
@@ -157,20 +191,29 @@ func Run(pushCfg *Config) int {
 		ownerIPSet[ownerInfo.IP] = struct{}{}
 		ownerInfos = append(ownerInfos, ownerInfo) // Keep order for fragment assignment
 
-		// Load the key using the path from the owner string
-		slog.Debug("Loading owner public key", "ip", ownerInfo.IP, "path", ownerInfo.PublicKey)
-		encrypter, err := crypto.LoadOwnerPublicKeyEncrypter(ownerInfo.PublicKey)
+		// Load the hybrid public key using the path from the owner string
+		slog.Debug("Loading owner hybrid public key", "ip", ownerInfo.IP, "path", ownerInfo.HybridPublicKey)
+		encrypter, err := crypto.LoadOwnerPublicKeyEncrypter(ownerInfo.HybridPublicKey)
 		if err != nil {
-			slog.Error("Failed to load owner public key", "ip", ownerInfo.IP, "path", ownerInfo.PublicKey, "err", err)
+			slog.Error("Failed to load owner hybrid public key", "ip", ownerInfo.IP, "path", ownerInfo.HybridPublicKey, "err", err)
 			return 1
 		}
-		ownerKeys[ownerInfo.IP] = encrypter
-		slog.Info("Loaded owner public key", "ip", ownerInfo.IP)
+		ownerHybridEncrypters[ownerInfo.IP] = encrypter
+		totalFragmentCountSpecified += ownerInfo.Count
+		slog.Info("Loaded owner hybrid public key", "ip", ownerInfo.IP, "count", ownerInfo.Count)
+	}
+
+	// --- Validate Total Fragment Count ---
+	if totalFragmentCountSpecified != pushCfg.Parts {
+		slog.Error("Total fragment count specified by owners does not match --parts",
+			"total_specified", totalFragmentCountSpecified,
+			"parts_flag", pushCfg.Parts)
+		return 1
 	}
 
 	// --- Split Secret ---
 	slog.Debug("Splitting secret", "parts", pushCfg.Parts, "threshold", pushCfg.Threshold)
-	fragments, err := crypto.SplitSecret([]byte(pushCfg.Secret), pushCfg.Parts, pushCfg.Threshold)
+	fragments, err := crypto.SplitSecret([]byte(pushCfg.Secret), pushCfg.Parts, pushCfg.Threshold) // Threshold is int from flags
 	if err != nil {
 		slog.Error("Failed to split secret", "err", err)
 		return 1
@@ -178,35 +221,71 @@ func Run(pushCfg *Config) int {
 	slog.Info("Secret split into fragments", "count", len(fragments))
 
 	// --- Encrypt Fragments ---
-	encryptedFragments := make(map[string][]byte) // Map: Owner IP -> Encrypted Fragment
-	if len(fragments) != len(ownerInfos) {
+	// Map: Owner IP -> List of Encrypted Fragments
+	ownerEncryptedFragments := make(map[string]*pb.FragmentList)
+	numOwners := len(ownerInfos)
+	if numOwners == 0 {
+		// Should have been caught by validation, but double-check
+		slog.Error("Internal error: No owner info available for fragment encryption")
+		return 1
+	}
+	if len(fragments) != pushCfg.Parts {
 		// This should not happen if SplitSecret worked correctly
-		slog.Error("Internal error: fragment count mismatch", "fragments", len(fragments), "owners", len(ownerInfos))
+		slog.Error("Internal error: fragment count mismatch", "fragments", len(fragments), "expected_parts", pushCfg.Parts)
 		return 1
 	}
 
-	for i, ownerInfo := range ownerInfos {
-		fragment := fragments[i]
-		encrypter := ownerKeys[ownerInfo.IP] // Assumes IP is unique and present
-		slog.Debug("Encrypting fragment", "owner_ip", ownerInfo.IP, "fragment_index", i)
-		encrypted, err := crypto.EncryptFragment(encrypter, fragment)
-		if err != nil {
-			slog.Error("Failed to encrypt fragment for owner", "owner_ip", ownerInfo.IP, "err", err)
-			return 1
+	slog.Info("Encrypting and distributing fragments according to owner counts", "fragment_count", len(fragments), "owner_count", numOwners)
+	fragmentIndex := 0
+	for _, ownerInfo := range ownerInfos {
+		encrypter := ownerHybridEncrypters[ownerInfo.IP]
+		slog.Debug("Assigning fragments to owner", "owner_ip", ownerInfo.IP, "count", ownerInfo.Count)
+
+		// Initialize the list for this owner
+		ownerEncryptedFragments[ownerInfo.IP] = &pb.FragmentList{Fragments: make([][]byte, 0, ownerInfo.Count)}
+
+		for range ownerInfo.Count {
+			if fragmentIndex >= len(fragments) {
+				// Should have been caught by validation, but safeguard
+				slog.Error("Internal error: Not enough fragments generated for distribution", "needed", totalFragmentCountSpecified, "generated", len(fragments))
+				return 1
+			}
+			fragment := fragments[fragmentIndex]
+
+			slog.Debug("Encrypting fragment for owner", "fragment_index", fragmentIndex, "assigned_owner_ip", ownerInfo.IP)
+			encrypted, err := crypto.EncryptFragment(encrypter, fragment)
+			if err != nil {
+				slog.Error("Failed to encrypt fragment",
+					"fragment_index", fragmentIndex,
+					"assigned_owner_ip", ownerInfo.IP,
+					"hybrid_key_path", ownerInfo.HybridPublicKey,
+					"err", err)
+				return 1
+			}
+
+			// Append the encrypted fragment to the list for this owner
+			ownerEncryptedFragments[ownerInfo.IP].Fragments = append(ownerEncryptedFragments[ownerInfo.IP].Fragments, encrypted)
+			slog.Debug("Appended encrypted fragment to owner's list", "fragment_index", fragmentIndex, "owner_ip", ownerInfo.IP, "list_size_now", len(ownerEncryptedFragments[ownerInfo.IP].Fragments))
+			fragmentIndex++
 		}
-		encryptedFragments[ownerInfo.IP] = encrypted
-		slog.Info("Encrypted fragment", "owner_ip", ownerInfo.IP)
 	}
+	// Sanity check: ensure all fragments were assigned
+	if fragmentIndex != len(fragments) {
+		slog.Error("Internal error: Fragment count mismatch after distribution", "assigned", fragmentIndex, "total", len(fragments))
+		return 1
+	}
+	slog.Info("Finished encrypting and distributing fragments")
 
 	// --- Construct Entry ---
 	entry := &pb.Entry{
 		Timestamp:      timestamppb.Now(),
 		Key:            pushCfg.Key,
 		Readers:        pushCfg.Readers, // Already a slice of strings
-		OwnerFragments: encryptedFragments,
+		OwnerFragments: ownerEncryptedFragments,
+		Threshold:      int32(pushCfg.Threshold), // Store the threshold
 		// Signature will be added next
 	}
-	slog.Debug("Constructed entry structure", "key", entry.Key, "timestamp", entry.Timestamp.AsTime())
+	slog.Debug("Constructed entry structure", "key", entry.Key, "timestamp", entry.Timestamp.AsTime(), "threshold", entry.Threshold)
 
 	// --- Sign Entry ---
 	slog.Debug("Signing entry with master key")

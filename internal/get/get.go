@@ -20,11 +20,12 @@ import (
 
 // Config holds the specific configuration needed for the get subcommand.
 type Config struct {
-	PrivateKeyPath string   `kong:"name='private-key',required,help='Path to the client private key JSON file (for authentication).'"`
-	Key            string   `kong:"name='key',required,help='The key name for the secret to retrieve.'"`
-	OutputFile     string   `kong:"name='output',short='o',help='Path to write the reconstructed secret to (stdout if not specified).'"`
-	Targets        []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to query. Repeat for each target. Can be sourced from --config.'"`
-	ConfigPath     string   `kong:"name='config',optional,help='Path to a configuration file to load parameters from (targets, potentially owner info).'"`
+	SigningPrivateKeyPath string   `kong:"name='signing-private-key',required,help='Path to the client private key JSON file (for signing requests).'"`
+	HybridPrivateKeyPath  string   `kong:"name='hybrid-private-key',required,help='Path to the client private key JSON file (for decrypting received fragments).'"`
+	Key                   string   `kong:"name='key',required,help='The key name for the secret to retrieve.'"`
+	OutputFile            string   `kong:"name='output',short='o',help='Path to write the reconstructed secret to (stdout if not specified).'"`
+	Targets               []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to query. Repeat for each target. Can be sourced from --config.'"`
+	ConfigPath            string   `kong:"name='config',optional,help='Path to a configuration file to load parameters from (targets, peer info).'"`
 	// LogLevel is handled globally
 }
 
@@ -79,20 +80,31 @@ func Run(getCfg *Config) int {
 		slog.Error("Key cannot be empty.")
 		return 1
 	}
-	if getCfg.PrivateKeyPath == "" {
-		slog.Error("Client private key path cannot be empty.")
+	if getCfg.SigningPrivateKeyPath == "" {
+		slog.Error("Client signing private key path cannot be empty.")
+		return 1
+	}
+	if getCfg.HybridPrivateKeyPath == "" {
+		slog.Error("Client hybrid private key path cannot be empty.")
 		return 1
 	}
 
-	// --- Load Client Private Key (Signer only needed for auth) ---
-	slog.Debug("Loading client private key", "path", getCfg.PrivateKeyPath)
-	// We only need the signer part for authenticating requests to peers.
-	clientSigner, err := crypto.LoadPrivateKeySigner(getCfg.PrivateKeyPath)
+	// --- Load Client Keys ---
+	slog.Debug("Loading client signing private key", "path", getCfg.SigningPrivateKeyPath)
+	clientSigner, err := crypto.LoadPrivateKeySigner(getCfg.SigningPrivateKeyPath)
 	if err != nil {
-		slog.Error("Failed to load client private key", "path", getCfg.PrivateKeyPath, "err", err)
+		slog.Error("Failed to load client signing private key", "path", getCfg.SigningPrivateKeyPath, "err", err)
 		return 1
 	}
-	slog.Info("Loaded client private key successfully")
+	slog.Info("Loaded client signing private key successfully")
+
+	slog.Debug("Loading client hybrid private key", "path", getCfg.HybridPrivateKeyPath)
+	clientDecrypter, err := crypto.LoadClientHybridPrivateKey(getCfg.HybridPrivateKeyPath)
+	if err != nil {
+		slog.Error("Failed to load client hybrid private key", "path", getCfg.HybridPrivateKeyPath, "err", err)
+		return 1
+	}
+	slog.Info("Loaded client hybrid private key successfully")
 
 	// --- Connect to Targets and Find Latest Entry ---
 	// We need to find the latest timestamp for the key across all targets.
@@ -106,20 +118,14 @@ func Run(getCfg *Config) int {
 		slog.Error("Key not found on any target node", "key", getCfg.Key)
 		return 1 // Or a different exit code for not found?
 	}
-	slog.Info("Found latest entry", "key", latestEntry.Key, "timestamp", latestEntry.Timestamp.AsTime(), "source_node", targetEndpointForGet)
+	slog.Info("Found latest entry", "key", latestEntry.Key, "timestamp", latestEntry.Timestamp.AsTime(), "threshold", latestEntry.Threshold, "source_node", targetEndpointForGet)
 
 	// --- Determine Owners and Threshold ---
-	// The threshold isn't explicitly stored in the entry. We need to infer it.
-	// Shamir library requires threshold to reconstruct. How to get it?
-	// Option 1: Assume threshold is len(OwnerFragments) - requires all owners to be available. Risky.
-	// Option 2: Store threshold in the entry (requires proto change & push update). Best.
-	// Option 3: Try combining with increasing numbers of fragments? Inefficient.
-	// Option 4: Require threshold as a command-line argument for `get`. Simple but requires user knowledge.
-	// Let's go with Option 4 for now. Add a --threshold flag to getCfg.
-	// *** EDIT: User did not request threshold flag. Let's try to infer it. ***
-	// We can get the list of owners from the entry. Let's assume we need to contact *all* of them
-	// for now, and the CombineFragments function will tell us if we have enough based on the
-	// embedded threshold information within the fragments themselves (Shamir library handles this).
+	threshold := latestEntry.Threshold
+	if threshold <= 0 {
+		slog.Error("Invalid threshold found in entry", "key", getCfg.Key, "threshold", threshold)
+		return 1
+	}
 
 	ownerIPs := make([]string, 0, len(latestEntry.OwnerFragments))
 	for ip := range latestEntry.OwnerFragments {
@@ -148,10 +154,10 @@ func Run(getCfg *Config) int {
 	}
 
 	// --- Call GetDecoded on Owner Nodes Concurrently ---
-	slog.Info("Requesting decrypted fragments from owner nodes", "owners", ownerIPs)
+	slog.Info("Requesting encrypted fragments from owner nodes", "owners", ownerIPs)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	decryptedFragments := make([][]byte, 0, len(ownerIPs))
+	encryptedFragments := make([][]byte, 0, len(ownerIPs)) // Store encrypted fragments first
 	getDecodedErrors := make(map[string]error)
 
 	getDecodedCtx, getDecodedCancel := context.WithTimeout(context.Background(), 60*time.Second) // Timeout for all GetDecoded calls
@@ -192,14 +198,15 @@ func Run(getCfg *Config) int {
 			mu.Lock()
 			switch {
 			case err != nil:
-				slog.Warn("Failed to get decoded fragment from owner", "owner_ip", ip, "key", getCfg.Key, "err", err)
+				slog.Warn("Failed to get encrypted fragments from owner", "owner_ip", ip, "key", getCfg.Key, "err", err)
 				getDecodedErrors[ip] = err
-			case resp == nil || len(resp.DecryptedFragment) == 0:
-				slog.Warn("Received empty fragment from owner", "owner_ip", ip, "key", getCfg.Key)
-				getDecodedErrors[ip] = errors.New("received empty fragment")
+			case resp == nil || len(resp.EncryptedFragments) == 0: // Check the correct field name (plural)
+				slog.Warn("Received empty encrypted fragment list from owner", "owner_ip", ip, "key", getCfg.Key)
+				getDecodedErrors[ip] = errors.New("received empty encrypted fragment list")
 			default:
-				slog.Info("Successfully received decrypted fragment", "owner_ip", ip, "key", getCfg.Key)
-				decryptedFragments = append(decryptedFragments, resp.DecryptedFragment)
+				slog.Info("Successfully received encrypted fragments", "owner_ip", ip, "key", getCfg.Key, "count", len(resp.EncryptedFragments))
+				// Add all received fragments to the list
+				encryptedFragments = append(encryptedFragments, resp.EncryptedFragments...)
 			}
 			mu.Unlock()
 		}(ownerIP, ownerEndpoints[ownerIP])
@@ -210,19 +217,45 @@ func Run(getCfg *Config) int {
 	// --- Combine Fragments ---
 	if len(getDecodedErrors) > 0 {
 		slog.Error("Failed to retrieve fragments from some owners", "errors", getDecodedErrors)
-		// Continue anyway, CombineFragments might succeed if enough fragments were retrieved
+		// Continue to decryption and combination attempt
 	}
 
-	if len(decryptedFragments) == 0 {
-		slog.Error("No decrypted fragments were retrieved successfully.")
+	if len(encryptedFragments) == 0 {
+		slog.Error("No encrypted fragments were retrieved successfully.")
 		return 1
 	}
 
-	slog.Info("Attempting to combine fragments", "count", len(decryptedFragments))
+	// --- Decrypt Fragments ---
+	slog.Info("Decrypting received fragments", "count", len(encryptedFragments))
+	decryptedFragments := make([][]byte, 0, len(encryptedFragments))
+	decryptionErrors := 0
+	for i, encFrag := range encryptedFragments {
+		decFrag, err := crypto.DecryptFragment(clientDecrypter, encFrag)
+		if err != nil {
+			slog.Warn("Failed to decrypt fragment", "index", i, "err", err)
+			decryptionErrors++
+			// Do not add failed fragment to the list for combination
+			continue
+		}
+		decryptedFragments = append(decryptedFragments, decFrag)
+	}
+
+	if len(decryptedFragments) < int(threshold) {
+		slog.Error("Not enough fragments decrypted successfully to meet threshold",
+			"decrypted_count", len(decryptedFragments),
+			"required_threshold", threshold,
+			"retrieved_count", len(encryptedFragments),
+			"decryption_errors", decryptionErrors)
+		return 1
+	}
+	slog.Info("Successfully decrypted fragments", "count", len(decryptedFragments), "required_threshold", threshold)
+
+	// --- Combine Decrypted Fragments ---
+	slog.Info("Attempting to combine decrypted fragments", "count", len(decryptedFragments))
 	reconstructedSecret, err := crypto.CombineFragments(decryptedFragments)
 	if err != nil {
-		slog.Error("Failed to combine fragments", "err", err, "fragments_retrieved", len(decryptedFragments))
-		// This likely means not enough *valid* fragments were retrieved to meet the threshold.
+		slog.Error("Failed to combine decrypted fragments", "err", err, "fragments_provided", len(decryptedFragments))
+		// This might indicate an issue with the fragments themselves or the threshold logic
 		return 1
 	}
 	slog.Info("Successfully reconstructed secret")

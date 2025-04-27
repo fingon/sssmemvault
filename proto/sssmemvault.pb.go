@@ -22,20 +22,67 @@ const (
 )
 
 // Represents a single secret entry stored in the vault
+// Represents a list of fragments, typically associated with one owner IP.
+type FragmentList struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Fragments     [][]byte               `protobuf:"bytes,1,rep,name=fragments,proto3" json:"fragments,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FragmentList) Reset() {
+	*x = FragmentList{}
+	mi := &file_proto_sssmemvault_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FragmentList) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FragmentList) ProtoMessage() {}
+
+func (x *FragmentList) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_sssmemvault_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FragmentList.ProtoReflect.Descriptor instead.
+func (*FragmentList) Descriptor() ([]byte, []int) {
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *FragmentList) GetFragments() [][]byte {
+	if x != nil {
+		return x.Fragments
+	}
+	return nil
+}
+
+// Represents a single secret entry stored in the vault
 type Entry struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Timestamp      *timestamppb.Timestamp `protobuf:"bytes,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	Key            string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
-	Readers        []string               `protobuf:"bytes,3,rep,name=readers,proto3" json:"readers,omitempty"`                                                                                                               // List of IPs allowed to get decoded fragments
-	OwnerFragments map[string][]byte      `protobuf:"bytes,4,rep,name=owner_fragments,json=ownerFragments,proto3" json:"owner_fragments,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Map: Owner IP -> Encrypted SSS Fragment
-	Signature      []byte                 `protobuf:"bytes,5,opt,name=signature,proto3" json:"signature,omitempty"`                                                                                                           // Master public key signature over the entry data (excluding this field)
+	state          protoimpl.MessageState   `protogen:"open.v1"`
+	Timestamp      *timestamppb.Timestamp   `protobuf:"bytes,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Key            string                   `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+	Readers        []string                 `protobuf:"bytes,3,rep,name=readers,proto3" json:"readers,omitempty"`                                                                                                               // List of IPs allowed to get decoded fragments
+	OwnerFragments map[string]*FragmentList `protobuf:"bytes,4,rep,name=owner_fragments,json=ownerFragments,proto3" json:"owner_fragments,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Map: Owner IP -> List of Encrypted SSS Fragments
+	Threshold      int32                    `protobuf:"varint,5,opt,name=threshold,proto3" json:"threshold,omitempty"`                                                                                                          // Number of fragments required to reconstruct the secret
+	Signature      []byte                   `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`                                                                                                           // Master public key signature over the entry data (excluding this field)
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Entry) Reset() {
 	*x = Entry{}
-	mi := &file_proto_sssmemvault_proto_msgTypes[0]
+	mi := &file_proto_sssmemvault_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -47,7 +94,7 @@ func (x *Entry) String() string {
 func (*Entry) ProtoMessage() {}
 
 func (x *Entry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sssmemvault_proto_msgTypes[0]
+	mi := &file_proto_sssmemvault_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -60,7 +107,7 @@ func (x *Entry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Entry.ProtoReflect.Descriptor instead.
 func (*Entry) Descriptor() ([]byte, []int) {
-	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{0}
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *Entry) GetTimestamp() *timestamppb.Timestamp {
@@ -84,11 +131,18 @@ func (x *Entry) GetReaders() []string {
 	return nil
 }
 
-func (x *Entry) GetOwnerFragments() map[string][]byte {
+func (x *Entry) GetOwnerFragments() map[string]*FragmentList {
 	if x != nil {
 		return x.OwnerFragments
 	}
 	return nil
+}
+
+func (x *Entry) GetThreshold() int32 {
+	if x != nil {
+		return x.Threshold
+	}
+	return 0
 }
 
 func (x *Entry) GetSignature() []byte {
@@ -109,7 +163,7 @@ type EntryMetadata struct {
 
 func (x *EntryMetadata) Reset() {
 	*x = EntryMetadata{}
-	mi := &file_proto_sssmemvault_proto_msgTypes[1]
+	mi := &file_proto_sssmemvault_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -121,7 +175,7 @@ func (x *EntryMetadata) String() string {
 func (*EntryMetadata) ProtoMessage() {}
 
 func (x *EntryMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sssmemvault_proto_msgTypes[1]
+	mi := &file_proto_sssmemvault_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -134,7 +188,7 @@ func (x *EntryMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EntryMetadata.ProtoReflect.Descriptor instead.
 func (*EntryMetadata) Descriptor() ([]byte, []int) {
-	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{1}
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *EntryMetadata) GetTimestamp() *timestamppb.Timestamp {
@@ -160,7 +214,7 @@ type ListRequest struct {
 
 func (x *ListRequest) Reset() {
 	*x = ListRequest{}
-	mi := &file_proto_sssmemvault_proto_msgTypes[2]
+	mi := &file_proto_sssmemvault_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -172,7 +226,7 @@ func (x *ListRequest) String() string {
 func (*ListRequest) ProtoMessage() {}
 
 func (x *ListRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sssmemvault_proto_msgTypes[2]
+	mi := &file_proto_sssmemvault_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -185,7 +239,7 @@ func (x *ListRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRequest.ProtoReflect.Descriptor instead.
 func (*ListRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{2}
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{3}
 }
 
 // Response message for the List RPC
@@ -198,7 +252,7 @@ type ListResponse struct {
 
 func (x *ListResponse) Reset() {
 	*x = ListResponse{}
-	mi := &file_proto_sssmemvault_proto_msgTypes[3]
+	mi := &file_proto_sssmemvault_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -210,7 +264,7 @@ func (x *ListResponse) String() string {
 func (*ListResponse) ProtoMessage() {}
 
 func (x *ListResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sssmemvault_proto_msgTypes[3]
+	mi := &file_proto_sssmemvault_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -223,7 +277,7 @@ func (x *ListResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListResponse.ProtoReflect.Descriptor instead.
 func (*ListResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{3}
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ListResponse) GetEntries() []*EntryMetadata {
@@ -244,7 +298,7 @@ type GetRequest struct {
 
 func (x *GetRequest) Reset() {
 	*x = GetRequest{}
-	mi := &file_proto_sssmemvault_proto_msgTypes[4]
+	mi := &file_proto_sssmemvault_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -256,7 +310,7 @@ func (x *GetRequest) String() string {
 func (*GetRequest) ProtoMessage() {}
 
 func (x *GetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sssmemvault_proto_msgTypes[4]
+	mi := &file_proto_sssmemvault_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -269,7 +323,7 @@ func (x *GetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRequest.ProtoReflect.Descriptor instead.
 func (*GetRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{4}
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *GetRequest) GetTimestamp() *timestamppb.Timestamp {
@@ -296,7 +350,7 @@ type GetResponse struct {
 
 func (x *GetResponse) Reset() {
 	*x = GetResponse{}
-	mi := &file_proto_sssmemvault_proto_msgTypes[5]
+	mi := &file_proto_sssmemvault_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -308,7 +362,7 @@ func (x *GetResponse) String() string {
 func (*GetResponse) ProtoMessage() {}
 
 func (x *GetResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sssmemvault_proto_msgTypes[5]
+	mi := &file_proto_sssmemvault_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -321,7 +375,7 @@ func (x *GetResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetResponse.ProtoReflect.Descriptor instead.
 func (*GetResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{5}
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *GetResponse) GetEntry() *Entry {
@@ -342,7 +396,7 @@ type GetDecodedRequest struct {
 
 func (x *GetDecodedRequest) Reset() {
 	*x = GetDecodedRequest{}
-	mi := &file_proto_sssmemvault_proto_msgTypes[6]
+	mi := &file_proto_sssmemvault_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -354,7 +408,7 @@ func (x *GetDecodedRequest) String() string {
 func (*GetDecodedRequest) ProtoMessage() {}
 
 func (x *GetDecodedRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sssmemvault_proto_msgTypes[6]
+	mi := &file_proto_sssmemvault_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -367,7 +421,7 @@ func (x *GetDecodedRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetDecodedRequest.ProtoReflect.Descriptor instead.
 func (*GetDecodedRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{6}
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GetDecodedRequest) GetTimestamp() *timestamppb.Timestamp {
@@ -386,15 +440,15 @@ func (x *GetDecodedRequest) GetKey() string {
 
 // Response message for the GetDecoded RPC
 type GetDecodedResponse struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	DecryptedFragment []byte                 `protobuf:"bytes,1,opt,name=decrypted_fragment,json=decryptedFragment,proto3" json:"decrypted_fragment,omitempty"` // The SSS fragment, decrypted by the owner node
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	EncryptedFragments [][]byte               `protobuf:"bytes,1,rep,name=encrypted_fragments,json=encryptedFragments,proto3" json:"encrypted_fragments,omitempty"` // The SSS fragments, decrypted by the owner node and then re-encrypted for the requestor using the requestor's hybrid public key.
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *GetDecodedResponse) Reset() {
 	*x = GetDecodedResponse{}
-	mi := &file_proto_sssmemvault_proto_msgTypes[7]
+	mi := &file_proto_sssmemvault_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -406,7 +460,7 @@ func (x *GetDecodedResponse) String() string {
 func (*GetDecodedResponse) ProtoMessage() {}
 
 func (x *GetDecodedResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sssmemvault_proto_msgTypes[7]
+	mi := &file_proto_sssmemvault_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -419,12 +473,12 @@ func (x *GetDecodedResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetDecodedResponse.ProtoReflect.Descriptor instead.
 func (*GetDecodedResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{7}
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{8}
 }
 
-func (x *GetDecodedResponse) GetDecryptedFragment() []byte {
+func (x *GetDecodedResponse) GetEncryptedFragments() [][]byte {
 	if x != nil {
-		return x.DecryptedFragment
+		return x.EncryptedFragments
 	}
 	return nil
 }
@@ -439,7 +493,7 @@ type PushRequest struct {
 
 func (x *PushRequest) Reset() {
 	*x = PushRequest{}
-	mi := &file_proto_sssmemvault_proto_msgTypes[8]
+	mi := &file_proto_sssmemvault_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -451,7 +505,7 @@ func (x *PushRequest) String() string {
 func (*PushRequest) ProtoMessage() {}
 
 func (x *PushRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sssmemvault_proto_msgTypes[8]
+	mi := &file_proto_sssmemvault_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -464,7 +518,7 @@ func (x *PushRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushRequest.ProtoReflect.Descriptor instead.
 func (*PushRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{8}
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *PushRequest) GetEntry() *Entry {
@@ -483,7 +537,7 @@ type PushResponse struct {
 
 func (x *PushResponse) Reset() {
 	*x = PushResponse{}
-	mi := &file_proto_sssmemvault_proto_msgTypes[9]
+	mi := &file_proto_sssmemvault_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -495,7 +549,7 @@ func (x *PushResponse) String() string {
 func (*PushResponse) ProtoMessage() {}
 
 func (x *PushResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sssmemvault_proto_msgTypes[9]
+	mi := &file_proto_sssmemvault_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -508,23 +562,26 @@ func (x *PushResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushResponse.ProtoReflect.Descriptor instead.
 func (*PushResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{9}
+	return file_proto_sssmemvault_proto_rawDescGZIP(), []int{10}
 }
 
 var File_proto_sssmemvault_proto protoreflect.FileDescriptor
 
 const file_proto_sssmemvault_proto_rawDesc = "" +
 	"\n" +
-	"\x17proto/sssmemvault.proto\x12\vsssmemvault\x1a\x1fgoogle/protobuf/timestamp.proto\"\x9f\x02\n" +
+	"\x17proto/sssmemvault.proto\x12\vsssmemvault\x1a\x1fgoogle/protobuf/timestamp.proto\",\n" +
+	"\fFragmentList\x12\x1c\n" +
+	"\tfragments\x18\x01 \x03(\fR\tfragments\"\xd8\x02\n" +
 	"\x05Entry\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x18\n" +
 	"\areaders\x18\x03 \x03(\tR\areaders\x12O\n" +
 	"\x0fowner_fragments\x18\x04 \x03(\v2&.sssmemvault.Entry.OwnerFragmentsEntryR\x0eownerFragments\x12\x1c\n" +
-	"\tsignature\x18\x05 \x01(\fR\tsignature\x1aA\n" +
+	"\tthreshold\x18\x05 \x01(\x05R\tthreshold\x12\x1c\n" +
+	"\tsignature\x18\x06 \x01(\fR\tsignature\x1a\\\n" +
 	"\x13OwnerFragmentsEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\"[\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12/\n" +
+	"\x05value\x18\x02 \x01(\v2\x19.sssmemvault.FragmentListR\x05value:\x028\x01\"[\n" +
 	"\rEntryMetadata\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\"\r\n" +
@@ -539,9 +596,9 @@ const file_proto_sssmemvault_proto_rawDesc = "" +
 	"\x05entry\x18\x01 \x01(\v2\x12.sssmemvault.EntryR\x05entry\"_\n" +
 	"\x11GetDecodedRequest\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x10\n" +
-	"\x03key\x18\x02 \x01(\tR\x03key\"C\n" +
-	"\x12GetDecodedResponse\x12-\n" +
-	"\x12decrypted_fragment\x18\x01 \x01(\fR\x11decryptedFragment\"7\n" +
+	"\x03key\x18\x02 \x01(\tR\x03key\"E\n" +
+	"\x12GetDecodedResponse\x12/\n" +
+	"\x13encrypted_fragments\x18\x01 \x03(\fR\x12encryptedFragments\"7\n" +
 	"\vPushRequest\x12(\n" +
 	"\x05entry\x18\x01 \x01(\v2\x12.sssmemvault.EntryR\x05entry\"\x0e\n" +
 	"\fPushResponse2\x90\x02\n" +
@@ -564,43 +621,45 @@ func file_proto_sssmemvault_proto_rawDescGZIP() []byte {
 	return file_proto_sssmemvault_proto_rawDescData
 }
 
-var file_proto_sssmemvault_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_proto_sssmemvault_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_proto_sssmemvault_proto_goTypes = []any{
-	(*Entry)(nil),                 // 0: sssmemvault.Entry
-	(*EntryMetadata)(nil),         // 1: sssmemvault.EntryMetadata
-	(*ListRequest)(nil),           // 2: sssmemvault.ListRequest
-	(*ListResponse)(nil),          // 3: sssmemvault.ListResponse
-	(*GetRequest)(nil),            // 4: sssmemvault.GetRequest
-	(*GetResponse)(nil),           // 5: sssmemvault.GetResponse
-	(*GetDecodedRequest)(nil),     // 6: sssmemvault.GetDecodedRequest
-	(*GetDecodedResponse)(nil),    // 7: sssmemvault.GetDecodedResponse
-	(*PushRequest)(nil),           // 8: sssmemvault.PushRequest
-	(*PushResponse)(nil),          // 9: sssmemvault.PushResponse
-	nil,                           // 10: sssmemvault.Entry.OwnerFragmentsEntry
-	(*timestamppb.Timestamp)(nil), // 11: google.protobuf.Timestamp
+	(*FragmentList)(nil),          // 0: sssmemvault.FragmentList
+	(*Entry)(nil),                 // 1: sssmemvault.Entry
+	(*EntryMetadata)(nil),         // 2: sssmemvault.EntryMetadata
+	(*ListRequest)(nil),           // 3: sssmemvault.ListRequest
+	(*ListResponse)(nil),          // 4: sssmemvault.ListResponse
+	(*GetRequest)(nil),            // 5: sssmemvault.GetRequest
+	(*GetResponse)(nil),           // 6: sssmemvault.GetResponse
+	(*GetDecodedRequest)(nil),     // 7: sssmemvault.GetDecodedRequest
+	(*GetDecodedResponse)(nil),    // 8: sssmemvault.GetDecodedResponse
+	(*PushRequest)(nil),           // 9: sssmemvault.PushRequest
+	(*PushResponse)(nil),          // 10: sssmemvault.PushResponse
+	nil,                           // 11: sssmemvault.Entry.OwnerFragmentsEntry
+	(*timestamppb.Timestamp)(nil), // 12: google.protobuf.Timestamp
 }
 var file_proto_sssmemvault_proto_depIdxs = []int32{
-	11, // 0: sssmemvault.Entry.timestamp:type_name -> google.protobuf.Timestamp
-	10, // 1: sssmemvault.Entry.owner_fragments:type_name -> sssmemvault.Entry.OwnerFragmentsEntry
-	11, // 2: sssmemvault.EntryMetadata.timestamp:type_name -> google.protobuf.Timestamp
-	1,  // 3: sssmemvault.ListResponse.entries:type_name -> sssmemvault.EntryMetadata
-	11, // 4: sssmemvault.GetRequest.timestamp:type_name -> google.protobuf.Timestamp
-	0,  // 5: sssmemvault.GetResponse.entry:type_name -> sssmemvault.Entry
-	11, // 6: sssmemvault.GetDecodedRequest.timestamp:type_name -> google.protobuf.Timestamp
-	0,  // 7: sssmemvault.PushRequest.entry:type_name -> sssmemvault.Entry
-	2,  // 8: sssmemvault.SssMemVault.List:input_type -> sssmemvault.ListRequest
-	4,  // 9: sssmemvault.SssMemVault.Get:input_type -> sssmemvault.GetRequest
-	6,  // 10: sssmemvault.SssMemVault.GetDecoded:input_type -> sssmemvault.GetDecodedRequest
-	8,  // 11: sssmemvault.SssMemVault.Push:input_type -> sssmemvault.PushRequest
-	3,  // 12: sssmemvault.SssMemVault.List:output_type -> sssmemvault.ListResponse
-	5,  // 13: sssmemvault.SssMemVault.Get:output_type -> sssmemvault.GetResponse
-	7,  // 14: sssmemvault.SssMemVault.GetDecoded:output_type -> sssmemvault.GetDecodedResponse
-	9,  // 15: sssmemvault.SssMemVault.Push:output_type -> sssmemvault.PushResponse
-	12, // [12:16] is the sub-list for method output_type
-	8,  // [8:12] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	12, // 0: sssmemvault.Entry.timestamp:type_name -> google.protobuf.Timestamp
+	11, // 1: sssmemvault.Entry.owner_fragments:type_name -> sssmemvault.Entry.OwnerFragmentsEntry
+	12, // 2: sssmemvault.EntryMetadata.timestamp:type_name -> google.protobuf.Timestamp
+	2,  // 3: sssmemvault.ListResponse.entries:type_name -> sssmemvault.EntryMetadata
+	12, // 4: sssmemvault.GetRequest.timestamp:type_name -> google.protobuf.Timestamp
+	1,  // 5: sssmemvault.GetResponse.entry:type_name -> sssmemvault.Entry
+	12, // 6: sssmemvault.GetDecodedRequest.timestamp:type_name -> google.protobuf.Timestamp
+	1,  // 7: sssmemvault.PushRequest.entry:type_name -> sssmemvault.Entry
+	0,  // 8: sssmemvault.Entry.OwnerFragmentsEntry.value:type_name -> sssmemvault.FragmentList
+	3,  // 9: sssmemvault.SssMemVault.List:input_type -> sssmemvault.ListRequest
+	5,  // 10: sssmemvault.SssMemVault.Get:input_type -> sssmemvault.GetRequest
+	7,  // 11: sssmemvault.SssMemVault.GetDecoded:input_type -> sssmemvault.GetDecodedRequest
+	9,  // 12: sssmemvault.SssMemVault.Push:input_type -> sssmemvault.PushRequest
+	4,  // 13: sssmemvault.SssMemVault.List:output_type -> sssmemvault.ListResponse
+	6,  // 14: sssmemvault.SssMemVault.Get:output_type -> sssmemvault.GetResponse
+	8,  // 15: sssmemvault.SssMemVault.GetDecoded:output_type -> sssmemvault.GetDecodedResponse
+	10, // 16: sssmemvault.SssMemVault.Push:output_type -> sssmemvault.PushResponse
+	13, // [13:17] is the sub-list for method output_type
+	9,  // [9:13] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_proto_sssmemvault_proto_init() }
@@ -614,7 +673,7 @@ func file_proto_sssmemvault_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_sssmemvault_proto_rawDesc), len(file_proto_sssmemvault_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -28,7 +28,7 @@ var cli struct {
 
 	Daemon daemon.Config `kong:"cmd,help='Run the sssmemvault daemon node.'"`
 	Push   push.Config   `kong:"cmd,help='Push a new secret entry to target nodes.'"`
-	Get    get.Config    `kong:"cmd,help='Retrieve and reconstruct a secret from owner nodes.'"`
+	Get    get.Config    `kong:"cmd,help='Retrieve and reconstruct a secret from owner nodes.'"` // get.Config needs HybridPrivateKeyPath
 }
 
 func main() {

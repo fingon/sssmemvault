@@ -114,7 +114,8 @@ func marshalEntryForSigning(entry *pb.Entry) ([]byte, error) {
 		Timestamp:      &timestamppb.Timestamp{Seconds: entry.Timestamp.Seconds, Nanos: entry.Timestamp.Nanos}, // Ensure deep copy if mutable
 		Key:            entry.Key,
 		Readers:        append([]string(nil), entry.Readers...), // Copy slice
-		OwnerFragments: maps.Clone(entry.OwnerFragments),
+		OwnerFragments: maps.Clone(entry.OwnerFragments),        // Clone map
+		Threshold:      entry.Threshold,                         // Include threshold
 		// Signature field is explicitly omitted
 	}
 

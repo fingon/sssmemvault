@@ -19,12 +19,19 @@ service SssMemVault {
 }
 
 // Represents a single secret entry stored in the vault
+// Represents a list of fragments, typically associated with one owner IP.
+message FragmentList {
+  repeated bytes fragments = 1;
+}
+
+// Represents a single secret entry stored in the vault
 message Entry {
   google.protobuf.Timestamp timestamp = 1;
   string key = 2;
   repeated string readers = 3; // List of IPs allowed to get decoded fragments
-  map<string, bytes> owner_fragments = 4; // Map: Owner IP -> Encrypted SSS Fragment
-  bytes signature = 5; // Master public key signature over the entry data (excluding this field)
+  map<string, FragmentList> owner_fragments = 4; // Map: Owner IP -> List of Encrypted SSS Fragments
+  int32 threshold = 5; // Number of fragments required to reconstruct the secret
+  bytes signature = 6; // Master public key signature over the entry data (excluding this field)
 }
 
 // Metadata for an entry, used in ListResponse
@@ -62,7 +69,7 @@ message GetDecodedRequest {
 
 // Response message for the GetDecoded RPC
 message GetDecodedResponse {
-  bytes decrypted_fragment = 1; // The SSS fragment, decrypted by the owner node
+  repeated bytes encrypted_fragments = 1; // The SSS fragments, decrypted by the owner node and then re-encrypted for the requestor using the requestor's hybrid public key.
 }
 
 // Request message for the Push RPC

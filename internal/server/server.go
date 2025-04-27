@@ -191,39 +191,75 @@ func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecode
 	}
 	slog.Debug("GetDecoded: reader authorized", "key", req.Key, "reader_ip", requestingPeerIP)
 
-	// 4. Find the encrypted fragment belonging to *this* node (the one handling the request)
-	encryptedFragment, ok := entry.OwnerFragments[self.nodeIP]
-	if !ok {
+	// 4. Find the encrypted fragment(s) belonging to *this* node (the one handling the request)
+	fragmentList, ok := entry.OwnerFragments[self.nodeIP]
+	if !ok || fragmentList == nil || len(fragmentList.Fragments) == 0 {
 		// This means the entry exists, the reader is valid, but this specific node
-		// doesn't own a fragment for this entry. This shouldn't typically happen
+		// doesn't own a fragment for this entry, or the list is empty. This shouldn't typically happen
 		// if provisioning is done correctly, but handle it defensively.
-		slog.Error("GetDecoded failed: this node does not own a fragment for the requested entry",
+		slog.Error("GetDecoded failed: this node does not own a fragment list for the requested entry",
 			"key", req.Key,
 			"timestamp", req.Timestamp.AsTime(),
 			"node_ip", self.nodeIP,
 			"owner_ips", maps.Keys(entry.OwnerFragments)) // Requires Go 1.21+ for maps.Keys
-		return nil, status.Errorf(codes.NotFound, "This node (%s) does not hold a fragment for key %q", self.nodeIP, req.Key)
+		return nil, status.Errorf(codes.NotFound, "This node (%s) does not hold a fragment list for key %q", self.nodeIP, req.Key)
 	}
-	slog.Debug("GetDecoded: found encrypted fragment for this node", "key", req.Key, "node_ip", self.nodeIP)
+	slog.Debug("GetDecoded: found encrypted fragment list for this node", "key", req.Key, "node_ip", self.nodeIP, "fragment_count", len(fragmentList.Fragments))
 
-	// 5. Decrypt the fragment using this node's private key
-	decryptedFragment, err := crypto.DecryptFragment(self.cfg.PrivKeyDecrypter, encryptedFragment)
-	if err != nil {
-		// This likely indicates a key mismatch or corrupted data. Critical error.
-		slog.Error("GetDecoded failed: could not decrypt fragment",
+	// 5. Decrypt *all* fragments owned by this node
+	decryptedFragments := make([][]byte, 0, len(fragmentList.Fragments))
+	for i, encFrag := range fragmentList.Fragments {
+		decFrag, err := crypto.DecryptFragment(self.cfg.PrivKeyDecrypter, encFrag)
+		if err != nil {
+			// Log error but continue processing other fragments if possible.
+			// If even one fails, the client might not be able to reconstruct.
+			slog.Error("GetDecoded failed: could not decrypt one of the owned fragments",
+				"key", req.Key,
+				"timestamp", req.Timestamp.AsTime(),
+				"node_ip", self.nodeIP,
+				"fragment_index", i,
+				"err", err)
+			// Decide on behavior: return error immediately or try to return partial results?
+			// Returning error immediately is safer.
+			return nil, status.Errorf(codes.Internal, "Failed to decrypt owned fragment %d for key %q: %v", i, req.Key, err)
+		}
+		decryptedFragments = append(decryptedFragments, decFrag)
+		slog.Debug("GetDecoded: successfully decrypted owned fragment", "key", req.Key, "node_ip", self.nodeIP, "fragment_index", i)
+	}
+
+	// 6. Find the requesting peer's hybrid public key
+	requestorPeerCfg, ok := self.cfg.LoadedPeers[requestingPeerIP]
+	if !ok || requestorPeerCfg.PubKeyEncrypter == nil {
+		slog.Error("GetDecoded failed: could not find hybrid public key for requesting peer",
 			"key", req.Key,
-			"timestamp", req.Timestamp.AsTime(),
-			"node_ip", self.nodeIP,
-			"err", err)
-		return nil, status.Errorf(codes.Internal, "Failed to decrypt fragment for key %q: %v", req.Key, err)
+			"requesting_peer_ip", requestingPeerIP)
+		// This indicates a configuration issue on the server side.
+		return nil, status.Errorf(codes.Internal, "Configuration error: missing hybrid public key for peer %s", requestingPeerIP)
 	}
-	slog.Debug("GetDecoded: successfully decrypted fragment", "key", req.Key, "node_ip", self.nodeIP)
+	requestorEncrypter := requestorPeerCfg.PubKeyEncrypter
+	slog.Debug("GetDecoded: found hybrid public key for requestor", "key", req.Key, "requesting_peer_ip", requestingPeerIP)
 
-	// 6. Return the decrypted fragment
-	resp := &pb.GetDecodedResponse{
-		DecryptedFragment: decryptedFragment,
+	// 7. Re-encrypt *all* decrypted fragments using the requestor's public key
+	fragmentsForRequestor := make([][]byte, 0, len(decryptedFragments))
+	for i, decFrag := range decryptedFragments {
+		encFrag, err := crypto.EncryptFragment(requestorEncrypter, decFrag)
+		if err != nil {
+			slog.Error("GetDecoded failed: could not re-encrypt fragment for requestor",
+				"key", req.Key,
+				"requesting_peer_ip", requestingPeerIP,
+				"fragment_index", i,
+				"err", err)
+			return nil, status.Errorf(codes.Internal, "Failed to re-encrypt fragment %d for requestor %s: %v", i, requestingPeerIP, err)
+		}
+		fragmentsForRequestor = append(fragmentsForRequestor, encFrag)
+		slog.Debug("GetDecoded: successfully re-encrypted fragment for requestor", "key", req.Key, "requesting_peer_ip", requestingPeerIP, "fragment_index", i)
 	}
-	slog.Info("GetDecoded request successful", "key", req.Key, "timestamp", req.Timestamp.AsTime(), "requesting_peer_ip", requestingPeerIP)
+
+	// 8. Return the list of re-encrypted fragments
+	resp := &pb.GetDecodedResponse{
+		EncryptedFragments: fragmentsForRequestor, // Use the correct field name
+	}
+	slog.Info("GetDecoded request successful", "key", req.Key, "timestamp", req.Timestamp.AsTime(), "requesting_peer_ip", requestingPeerIP, "fragment_count", len(fragmentsForRequestor))
 	return resp, nil
 }
 
