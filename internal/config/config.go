@@ -47,8 +47,9 @@ type Config struct {
 	LoadedPeers      map[string]*PeerConfig `yaml:"-"` // Processed peers with loaded keys (map key is Name)
 }
 
-// LoadConfig reads the configuration file, validates it, and loads keys.
-func LoadConfig(path string) (*Config, error) {
+// loadConfigInternal performs the core logic of reading, unmarshalling, validating,
+// and loading keys from a configuration file.
+func loadConfigInternal(path string, ignoreOwnKeyErrors bool) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file %q: %w", path, err)
@@ -64,11 +65,13 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	// --- Validation ---
-	if cfg.SigningPrivateKeyPath == "" {
-		return nil, errors.New("config validation failed: signing_private_key_path is required")
-	}
-	if cfg.HybridPrivateKeyPath == "" {
-		return nil, errors.New("config validation failed: hybrid_private_key_path is required")
+	if !ignoreOwnKeyErrors {
+		if cfg.SigningPrivateKeyPath == "" {
+			return nil, errors.New("config validation failed: signing_private_key_path is required")
+		}
+		if cfg.HybridPrivateKeyPath == "" {
+			return nil, errors.New("config validation failed: hybrid_private_key_path is required")
+		}
 	}
 	if cfg.MasterSigningPublicKey == "" {
 		return nil, errors.New("config validation failed: master_signing_public_key is required")
@@ -78,128 +81,40 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	// --- Load Own Keys ---
-	cfg.PrivKeySigner, err = crypto.LoadPrivateKeySigner(cfg.SigningPrivateKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load own signing private key: %w", err)
-	}
-	slog.Info("Loaded own signing private key", "path", cfg.SigningPrivateKeyPath)
-
-	cfg.PrivKeyDecrypter, err = crypto.LoadPrivateKeyDecrypter(cfg.HybridPrivateKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load own hybrid private key: %w", err)
-	}
-	slog.Info("Loaded own hybrid private key", "path", cfg.HybridPrivateKeyPath)
-
-	// --- Load Master Key ---
-	cfg.MasterPubKey, err = crypto.LoadPublicKeyVerifier(cfg.MasterSigningPublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load master signing public key: %w", err)
-	}
-	slog.Info("Loaded master signing public key", "path", cfg.MasterSigningPublicKey)
-
-	// --- Load Peer Keys ---
-	// Create a mutable copy to store loaded keys back into
-	loadedPeers := maps.Clone(cfg.Peers) // Requires Go 1.21+
-	if loadedPeers == nil {
-		loadedPeers = make(map[string]PeerConfig) // Initialize if Peers was nil
-	}
-
-	for name, peerCfg := range cfg.Peers {
-		if name == "" {
-			return nil, errors.New("config validation failed: peer name cannot be empty")
-		}
-		if peerCfg.SigningPublicKey == "" {
-			return nil, fmt.Errorf("config validation failed: signing_public_key is required for peer %q", name)
-		}
-		if peerCfg.HybridPublicKey == "" {
-			return nil, fmt.Errorf("config validation failed: hybrid_public_key is required for peer %q", name)
-		}
-		if peerCfg.Endpoint == "" {
-			// Allow empty endpoint for client-only entries (like 'get' client)
-			slog.Debug("Peer config has empty endpoint, assuming client-only entry", "peer_name", name)
-		}
-
-		// Load Signing Public Key (Verifier)
-		verifier, err := crypto.LoadPublicKeyVerifier(peerCfg.SigningPublicKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load signing public key for peer %q: %w", name, err)
-		}
-		slog.Info("Loaded peer signing public key", "peer_name", name, "path", peerCfg.SigningPublicKey)
-
-		// Load Hybrid Public Key (Encrypter)
-		encrypter, err := crypto.LoadPublicKeyEncrypter(peerCfg.HybridPublicKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load hybrid public key for peer %q: %w", name, err)
-		}
-		slog.Info("Loaded peer hybrid public key", "peer_name", name, "path", peerCfg.HybridPublicKey)
-
-		// Store the loaded keys back into the temporary map
-		loadedPeer := loadedPeers[name] // Get the struct copy from the cloned map
-		loadedPeer.PubKeyVerifier = verifier
-		loadedPeer.PubKeyEncrypter = encrypter
-		loadedPeers[name] = loadedPeer // Put the updated struct back
-	}
-	// Assign the map with loaded keys back to the config
-	cfg.LoadedPeers = make(map[string]*PeerConfig, len(loadedPeers))
-	for name, peer := range loadedPeers {
-		p := peer // Create a new variable p that is a copy of peer for this iteration
-		cfg.LoadedPeers[name] = &p
-	}
-
-	slog.Info("Configuration loaded successfully")
-	return &cfg, nil
-}
-
-// LoadConfigIgnoreOwnKey reads the configuration file, validates it, and loads keys,
-// but specifically ignores errors related to loading the node's own private key.
-// Useful for client tools (like push or get) that use a different key for their operations.
-func LoadConfigIgnoreOwnKey(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file %q: %w", path, err)
-	}
-
-	cfg := Config{
-		ListenAddress:    DefaultListenAddress,
-		MaxTimestampSkew: DefaultMaxTimestampSkew,
-		LoadedPeers:      make(map[string]*PeerConfig),
-	}
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config file %q: %w", path, err)
-	}
-
-	// --- Validation ---
-	// Skip own private key path validation for client tools
-	if cfg.MasterSigningPublicKey == "" {
-		return nil, errors.New("config validation failed: master_signing_public_key is required")
-	}
-	if cfg.MaxTimestampSkew <= 0 {
-		return nil, errors.New("config validation failed: max_timestamp_skew must be positive")
-	}
-
-	// --- Load Keys (Ignoring Own Private Keys) ---
-	// Attempt to load own keys, but log warning instead of failing on error
 	if cfg.SigningPrivateKeyPath != "" {
-		_, err = crypto.LoadPrivateKeySigner(cfg.SigningPrivateKeyPath)
+		cfg.PrivKeySigner, err = crypto.LoadPrivateKeySigner(cfg.SigningPrivateKeyPath)
 		if err != nil {
-			slog.Warn("Ignoring error while loading own signing private key specified in config", "path", cfg.SigningPrivateKeyPath, "err", err)
-			cfg.PrivKeySigner = nil
+			if ignoreOwnKeyErrors {
+				slog.Warn("Ignoring error while loading own signing private key specified in config", "path", cfg.SigningPrivateKeyPath, "err", err)
+				cfg.PrivKeySigner = nil // Ensure it's nil if loading failed
+			} else {
+				return nil, fmt.Errorf("failed to load own signing private key: %w", err)
+			}
 		} else {
-			slog.Debug("Loaded own signing private key specified in config (likely unused by client)", "path", cfg.SigningPrivateKeyPath)
+			slog.Info("Loaded own signing private key", "path", cfg.SigningPrivateKeyPath)
 		}
-	} else {
-		slog.Debug("Own signing_private_key_path not specified in config, skipping load.")
+	} else if !ignoreOwnKeyErrors {
+		// If we require own keys and the path is empty, it's an error (caught by validation above)
+		// If we ignore errors, log that it wasn't specified.
+		slog.Debug("Own signing_private_key_path not specified in config.")
 	}
+
 	if cfg.HybridPrivateKeyPath != "" {
-		_, err = crypto.LoadPrivateKeyDecrypter(cfg.HybridPrivateKeyPath)
+		cfg.PrivKeyDecrypter, err = crypto.LoadPrivateKeyDecrypter(cfg.HybridPrivateKeyPath)
 		if err != nil {
-			slog.Warn("Ignoring error while loading own hybrid private key specified in config", "path", cfg.HybridPrivateKeyPath, "err", err)
-			cfg.PrivKeyDecrypter = nil
+			if ignoreOwnKeyErrors {
+				slog.Warn("Ignoring error while loading own hybrid private key specified in config", "path", cfg.HybridPrivateKeyPath, "err", err)
+				cfg.PrivKeyDecrypter = nil // Ensure it's nil if loading failed
+			} else {
+				return nil, fmt.Errorf("failed to load own hybrid private key: %w", err)
+			}
 		} else {
-			slog.Debug("Loaded own hybrid private key specified in config (likely unused by client)", "path", cfg.HybridPrivateKeyPath)
+			slog.Info("Loaded own hybrid private key", "path", cfg.HybridPrivateKeyPath)
 		}
-	} else {
-		slog.Debug("Own hybrid_private_key_path not specified in config, skipping load.")
+	} else if !ignoreOwnKeyErrors {
+		// If we require own keys and the path is empty, it's an error (caught by validation above)
+		// If we ignore errors, log that it wasn't specified.
+		slog.Debug("Own hybrid_private_key_path not specified in config.")
 	}
 
 	// --- Load Master Key ---
@@ -214,8 +129,9 @@ func LoadConfigIgnoreOwnKey(path string) (*Config, error) {
 	if loadedPeers == nil {
 		loadedPeers = make(map[string]PeerConfig)
 	}
+	cfg.LoadedPeers = make(map[string]*PeerConfig, len(loadedPeers)) // Initialize the final map
 
-	for name, peerCfg := range cfg.Peers {
+	for name, peerCfg := range loadedPeers { // Iterate over the cloned map
 		if name == "" {
 			return nil, errors.New("config validation failed: peer name cannot be empty")
 		}
@@ -226,7 +142,6 @@ func LoadConfigIgnoreOwnKey(path string) (*Config, error) {
 			return nil, fmt.Errorf("config validation failed: hybrid_public_key is required for peer %q", name)
 		}
 		if peerCfg.Endpoint == "" {
-			// Allow empty endpoint for client-only entries
 			slog.Debug("Peer config has empty endpoint, assuming client-only entry", "peer_name", name)
 		}
 
@@ -244,19 +159,29 @@ func LoadConfigIgnoreOwnKey(path string) (*Config, error) {
 		}
 		slog.Info("Loaded peer hybrid public key", "peer_name", name, "path", peerCfg.HybridPublicKey)
 
-		// Store the loaded keys back into the temporary map
-		loadedPeer := loadedPeers[name]
+		// Store the loaded keys and the config struct pointer in the final map
+		loadedPeer := peerCfg // Create a copy of the struct from the iteration
 		loadedPeer.PubKeyVerifier = verifier
 		loadedPeer.PubKeyEncrypter = encrypter
-		loadedPeers[name] = loadedPeer
+		cfg.LoadedPeers[name] = &loadedPeer // Store pointer to the copy
 	}
 
-	cfg.LoadedPeers = make(map[string]*PeerConfig, len(loadedPeers))
-	for name, peer := range loadedPeers {
-		p := peer
-		cfg.LoadedPeers[name] = &p
+	logMsg := "Configuration loaded successfully"
+	if ignoreOwnKeyErrors {
+		logMsg += " (ignoring own private key errors)"
 	}
-
-	slog.Info("Configuration loaded successfully (ignoring own private key errors)")
+	slog.Info(logMsg)
 	return &cfg, nil
+}
+
+// LoadConfig reads the configuration file, validates it, and loads keys.
+func LoadConfig(path string) (*Config, error) {
+	return loadConfigInternal(path, false)
+}
+
+// LoadConfigIgnoreOwnKey reads the configuration file, validates it, and loads keys,
+// but specifically ignores errors related to loading the node's own private key.
+// Useful for client tools (like push or get) that use a different key for their operations.
+func LoadConfigIgnoreOwnKey(path string) (*Config, error) {
+	return loadConfigInternal(path, true)
 }

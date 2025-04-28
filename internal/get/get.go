@@ -61,6 +61,151 @@ func loadConfigAndDeriveParams(getCfg *Config) (*config.Config, error) {
 	return appCfg, nil
 }
 
+// loadClientKeys loads the signing and hybrid private keys for the client.
+func loadClientKeys(signingKeyPath, hybridKeyPath string) (tink.Signer, tink.HybridDecrypt, error) {
+	slog.Debug("Loading client signing private key", "path", signingKeyPath)
+	clientSigner, err := crypto.LoadPrivateKeySigner(signingKeyPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load client signing private key %q: %w", signingKeyPath, err)
+	}
+	slog.Info("Loaded client signing private key successfully")
+
+	slog.Debug("Loading client hybrid private key", "path", hybridKeyPath)
+	clientDecrypter, err := crypto.LoadClientHybridPrivateKey(hybridKeyPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load client hybrid private key %q: %w", hybridKeyPath, err)
+	}
+	slog.Info("Loaded client hybrid private key successfully")
+
+	return clientSigner, clientDecrypter, nil
+}
+
+// determineOwnerEndpoints finds the gRPC endpoints for the given owner names using the loaded config.
+func determineOwnerEndpoints(appCfg *config.Config, ownerNames []string, configPath string) (map[string]string, error) {
+	if appCfg == nil {
+		return nil, errors.New("cannot determine owner endpoints without a configuration file (--config)")
+	}
+	ownerEndpoints := make(map[string]string) // Map: Owner Name -> Endpoint
+	for _, ownerName := range ownerNames {
+		peerCfg, ok := appCfg.LoadedPeers[ownerName] // Use LoadedPeers which has pointers
+		if !ok || peerCfg == nil || peerCfg.Endpoint == "" {
+			return nil, fmt.Errorf("could not find endpoint for owner %q in configuration file %q", ownerName, configPath)
+		}
+		ownerEndpoints[ownerName] = peerCfg.Endpoint
+		slog.Debug("Found endpoint for owner", "owner_name", ownerName, "endpoint", peerCfg.Endpoint)
+	}
+	return ownerEndpoints, nil
+}
+
+// fetchEncryptedFragments concurrently calls GetDecoded on all owner nodes.
+func fetchEncryptedFragments(ctx context.Context, ownerEndpoints map[string]string, clientName string, clientSigner tink.Signer, entry *pb.Entry) ([][]byte, map[string]error) {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	encryptedFragments := make([][]byte, 0, len(ownerEndpoints)) // Store encrypted fragments first
+	getDecodedErrors := make(map[string]error)                   // Map: Owner Name -> Error
+
+	getDecodedRequest := &pb.GetDecodedRequest{
+		Key:       entry.Key,
+		Timestamp: entry.Timestamp,
+	}
+
+	slog.Info("Requesting encrypted fragments from owner nodes", "owners", ownerEndpoints)
+	for ownerName, endpoint := range ownerEndpoints {
+		wg.Add(1)
+		go func(name, ep string) {
+			defer wg.Done()
+			slog.Debug("Connecting to owner node for GetDecoded", "owner_name", name, "endpoint", ep)
+			conn, err := node.DialPeer(ctx, ep)
+			if err != nil {
+				slog.Warn("Failed to connect to owner node", "owner_name", name, "endpoint", ep, "err", err)
+				mu.Lock()
+				getDecodedErrors[name] = err
+				mu.Unlock()
+				return
+			}
+			defer func() {
+				if err := conn.Close(); err != nil {
+					slog.Warn("Error closing connection to owner node", "owner_name", name, "endpoint", ep, "err", err)
+				}
+			}()
+
+			client := pb.NewSssMemVaultClient(conn)
+			callCtx, callCancel := context.WithTimeout(ctx, 30*time.Second) // Timeout per call
+			defer callCancel()
+
+			slog.Debug("Calling GetDecoded on owner node", "owner_name", name, "key", entry.Key)
+			resp, err := node.CallGetDecodedFromClient(callCtx, client, clientName, clientSigner, getDecodedRequest)
+
+			mu.Lock()
+			switch {
+			case err != nil:
+				slog.Warn("Failed to get encrypted fragments from owner", "owner_name", name, "key", entry.Key, "err", err)
+				getDecodedErrors[name] = err
+			case resp == nil || len(resp.EncryptedFragments) == 0:
+				slog.Warn("Received empty encrypted fragment list from owner", "owner_name", name, "key", entry.Key)
+				getDecodedErrors[name] = errors.New("received empty encrypted fragment list")
+			default:
+				slog.Info("Successfully received encrypted fragments", "owner_name", name, "key", entry.Key, "count", len(resp.EncryptedFragments))
+				encryptedFragments = append(encryptedFragments, resp.EncryptedFragments...)
+			}
+			mu.Unlock()
+		}(ownerName, endpoint)
+	}
+
+	wg.Wait()
+	return encryptedFragments, getDecodedErrors
+}
+
+// decryptFragments decrypts the received fragments using the client's hybrid key.
+func decryptFragments(encryptedFragments [][]byte, clientDecrypter tink.HybridDecrypt) ([][]byte, int) {
+	slog.Info("Decrypting received fragments", "count", len(encryptedFragments))
+	decryptedFragments := make([][]byte, 0, len(encryptedFragments))
+	decryptionErrors := 0
+	for i, encFrag := range encryptedFragments {
+		decFrag, err := crypto.DecryptFragment(clientDecrypter, encFrag)
+		if err != nil {
+			slog.Warn("Failed to decrypt fragment", "index", i, "err", err)
+			decryptionErrors++
+			continue // Do not add failed fragment
+		}
+		decryptedFragments = append(decryptedFragments, decFrag)
+	}
+	return decryptedFragments, decryptionErrors
+}
+
+// combineAndOutput combines the decrypted fragments and writes the result.
+func combineAndOutput(decryptedFragments [][]byte, threshold int32, outputPath string) error {
+	if len(decryptedFragments) < int(threshold) {
+		return fmt.Errorf("not enough fragments decrypted successfully to meet threshold (got %d, need %d)",
+			len(decryptedFragments), threshold)
+	}
+	slog.Info("Successfully decrypted fragments", "count", len(decryptedFragments), "required_threshold", threshold)
+
+	slog.Info("Attempting to combine decrypted fragments", "count", len(decryptedFragments))
+	reconstructedSecret, err := crypto.CombineFragments(decryptedFragments)
+	if err != nil {
+		return fmt.Errorf("failed to combine decrypted fragments (provided %d): %w", len(decryptedFragments), err)
+	}
+	slog.Info("Successfully reconstructed secret")
+
+	// Output Secret
+	if outputPath == "" || outputPath == "-" {
+		slog.Debug("Writing secret to stdout")
+		_, err = os.Stdout.Write(reconstructedSecret)
+		if err == nil {
+			_, _ = os.Stdout.WriteString("\n") // Add newline for terminal
+		}
+	} else {
+		slog.Info("Writing secret to output file", "path", outputPath)
+		err = os.WriteFile(outputPath, reconstructedSecret, 0o600) // Restrictive permissions
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to write reconstructed secret: %w", err)
+	}
+	return nil
+}
+
 // Run executes the get operation.
 func Run(getCfg *Config) int {
 	slog.Info("Starting get operation...")
@@ -77,55 +222,30 @@ func Run(getCfg *Config) int {
 		slog.Error("No targets specified. Provide via --target flags or --config file.")
 		return 1
 	}
-	if getCfg.Key == "" {
-		slog.Error("Key cannot be empty.")
-		return 1
-	}
-	if getCfg.ClientName == "" {
-		slog.Error("Client name cannot be empty.")
-		return 1
-	}
-	if getCfg.SigningPrivateKeyPath == "" {
-		slog.Error("Client signing private key path cannot be empty.")
-		return 1
-	}
-	if getCfg.HybridPrivateKeyPath == "" {
-		slog.Error("Client hybrid private key path cannot be empty.")
+	// Other input validations... (key, clientName, key paths)
+	if getCfg.Key == "" || getCfg.ClientName == "" || getCfg.SigningPrivateKeyPath == "" || getCfg.HybridPrivateKeyPath == "" {
+		slog.Error("Missing required arguments: key, client-name, signing-private-key, or hybrid-private-key")
 		return 1
 	}
 
 	// --- Load Client Keys ---
-	slog.Debug("Loading client signing private key", "path", getCfg.SigningPrivateKeyPath)
-	clientSigner, err := crypto.LoadPrivateKeySigner(getCfg.SigningPrivateKeyPath)
+	clientSigner, clientDecrypter, err := loadClientKeys(getCfg.SigningPrivateKeyPath, getCfg.HybridPrivateKeyPath)
 	if err != nil {
-		slog.Error("Failed to load client signing private key", "path", getCfg.SigningPrivateKeyPath, "err", err)
+		slog.Error("Failed to load client keys", "err", err)
 		return 1
 	}
-	slog.Info("Loaded client signing private key successfully")
 
-	slog.Debug("Loading client hybrid private key", "path", getCfg.HybridPrivateKeyPath)
-	clientDecrypter, err := crypto.LoadClientHybridPrivateKey(getCfg.HybridPrivateKeyPath)
-	if err != nil {
-		slog.Error("Failed to load client hybrid private key", "path", getCfg.HybridPrivateKeyPath, "err", err)
-		return 1
-	}
-	slog.Info("Loaded client hybrid private key successfully")
-
-	// --- Connect to Targets and Find Latest Entry ---
 	// --- Find Latest Entry Across Targets ---
-	// We need to find the latest timestamp for the key across all targets.
-	// We also need the full entry to know the owners and the required threshold.
-	// Pass the client's name for authentication during List/Get calls.
-	latestEntry, targetEndpointForGet, err := findLatestEntry(getCfg.Targets, getCfg.Key, getCfg.ClientName, clientSigner, appCfg)
+	latestEntry, _, err := findLatestEntry(getCfg.Targets, getCfg.Key, getCfg.ClientName, clientSigner, appCfg)
 	if err != nil {
 		slog.Error("Failed to find latest entry for key", "key", getCfg.Key, "client_name", getCfg.ClientName, "err", err)
 		return 1
 	}
 	if latestEntry == nil {
 		slog.Error("Key not found on any target node", "key", getCfg.Key)
-		return 1 // Or a different exit code for not found?
+		return 1
 	}
-	slog.Info("Found latest entry", "key", latestEntry.Key, "timestamp", latestEntry.Timestamp.AsTime(), "threshold", latestEntry.Threshold, "source_node", targetEndpointForGet)
+	slog.Info("Found latest entry", "key", latestEntry.Key, "timestamp", latestEntry.Timestamp.AsTime(), "threshold", latestEntry.Threshold)
 
 	// --- Determine Owners and Threshold ---
 	threshold := latestEntry.Threshold
@@ -133,155 +253,45 @@ func Run(getCfg *Config) int {
 		slog.Error("Invalid threshold found in entry", "key", getCfg.Key, "threshold", threshold)
 		return 1
 	}
-
 	ownerNames := make([]string, 0, len(latestEntry.OwnerFragments))
 	for name := range latestEntry.OwnerFragments {
 		ownerNames = append(ownerNames, name)
 	}
-	sort.Strings(ownerNames) // Consistent ordering for logging/debugging
-
+	sort.Strings(ownerNames)
 	slog.Info("Identified owners for the entry", "key", getCfg.Key, "owners", ownerNames)
 
 	// --- Determine Owner Endpoints ---
-	// We need the gRPC endpoints for the owner names.
-	// Get them from the loaded config file if available, otherwise fail.
-	if appCfg == nil {
-		slog.Error("Cannot determine owner endpoints without a configuration file (--config)")
+	ownerEndpoints, err := determineOwnerEndpoints(appCfg, ownerNames, getCfg.ConfigPath)
+	if err != nil {
+		slog.Error("Failed to determine owner endpoints", "err", err)
 		return 1
 	}
-	ownerEndpoints := make(map[string]string) // Map: Owner Name -> Endpoint
-	for _, ownerName := range ownerNames {
-		peerCfg, ok := appCfg.LoadedPeers[ownerName] // Use LoadedPeers which has pointers
-		if !ok || peerCfg == nil || peerCfg.Endpoint == "" {
-			slog.Error("Could not find endpoint for owner in configuration file", "owner_name", ownerName, "config_path", getCfg.ConfigPath)
-			return 1
-		}
-		ownerEndpoints[ownerName] = peerCfg.Endpoint
-		slog.Debug("Found endpoint for owner", "owner_name", ownerName, "endpoint", peerCfg.Endpoint)
-	}
 
-	// --- Call GetDecoded on Owner Nodes Concurrently ---
-	slog.Info("Requesting encrypted fragments from owner nodes", "owners", ownerNames)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	encryptedFragments := make([][]byte, 0, len(ownerNames)) // Store encrypted fragments first
-	getDecodedErrors := make(map[string]error)               // Map: Owner Name -> Error
-
+	// --- Fetch Encrypted Fragments ---
 	getDecodedCtx, getDecodedCancel := context.WithTimeout(context.Background(), 60*time.Second) // Timeout for all GetDecoded calls
 	defer getDecodedCancel()
+	encryptedFragments, getDecodedErrors := fetchEncryptedFragments(getDecodedCtx, ownerEndpoints, getCfg.ClientName, clientSigner, latestEntry)
 
-	getDecodedRequest := &pb.GetDecodedRequest{
-		Key:       latestEntry.Key,
-		Timestamp: latestEntry.Timestamp,
-	}
-
-	for _, ownerName := range ownerNames {
-		wg.Add(1)
-		go func(name, endpoint string) {
-			defer wg.Done()
-			slog.Debug("Connecting to owner node for GetDecoded", "owner_name", name, "endpoint", endpoint)
-			conn, err := node.DialPeer(getDecodedCtx, endpoint)
-			if err != nil {
-				slog.Warn("Failed to connect to owner node", "owner_name", name, "endpoint", endpoint, "err", err)
-				mu.Lock()
-				getDecodedErrors[name] = err
-				mu.Unlock()
-				return
-			}
-			defer func() {
-				if err := conn.Close(); err != nil {
-					slog.Warn("Error closing connection to owner node", "owner_name", name, "endpoint", endpoint, "err", err)
-				}
-			}()
-
-			client := pb.NewSssMemVaultClient(conn)
-			callCtx, callCancel := context.WithTimeout(getDecodedCtx, 30*time.Second) // Timeout per call
-			defer callCancel()
-
-			slog.Debug("Calling GetDecoded on owner node", "owner_name", name, "key", getCfg.Key)
-			// Pass client name for authentication
-			resp, err := node.CallGetDecodedFromClient(callCtx, client, getCfg.ClientName, clientSigner, getDecodedRequest)
-
-			mu.Lock()
-			switch {
-			case err != nil:
-				slog.Warn("Failed to get encrypted fragments from owner", "owner_name", name, "key", getCfg.Key, "err", err)
-				getDecodedErrors[name] = err
-			case resp == nil || len(resp.EncryptedFragments) == 0: // Check the correct field name (plural)
-				slog.Warn("Received empty encrypted fragment list from owner", "owner_name", name, "key", getCfg.Key)
-				getDecodedErrors[name] = errors.New("received empty encrypted fragment list")
-			default:
-				slog.Info("Successfully received encrypted fragments", "owner_name", name, "key", getCfg.Key, "count", len(resp.EncryptedFragments))
-				// Add all received fragments to the list
-				encryptedFragments = append(encryptedFragments, resp.EncryptedFragments...)
-			}
-			mu.Unlock()
-		}(ownerName, ownerEndpoints[ownerName])
-	}
-
-	wg.Wait()
-
-	// --- Combine Fragments ---
 	if len(getDecodedErrors) > 0 {
 		slog.Error("Failed to retrieve fragments from some owners", "errors", getDecodedErrors)
-		// Continue to decryption and combination attempt
+		// Continue anyway, maybe enough fragments were retrieved
 	}
-
 	if len(encryptedFragments) == 0 {
 		slog.Error("No encrypted fragments were retrieved successfully.")
 		return 1
 	}
 
 	// --- Decrypt Fragments ---
-	slog.Info("Decrypting received fragments", "count", len(encryptedFragments))
-	decryptedFragments := make([][]byte, 0, len(encryptedFragments))
-	decryptionErrors := 0
-	for i, encFrag := range encryptedFragments {
-		decFrag, err := crypto.DecryptFragment(clientDecrypter, encFrag)
-		if err != nil {
-			slog.Warn("Failed to decrypt fragment", "index", i, "err", err)
-			decryptionErrors++
-			// Do not add failed fragment to the list for combination
-			continue
-		}
-		decryptedFragments = append(decryptedFragments, decFrag)
-	}
-
-	if len(decryptedFragments) < int(threshold) {
-		slog.Error("Not enough fragments decrypted successfully to meet threshold",
-			"decrypted_count", len(decryptedFragments),
-			"required_threshold", threshold,
-			"retrieved_count", len(encryptedFragments),
-			"decryption_errors", decryptionErrors)
+	decryptedFragments, decryptionErrors := decryptFragments(encryptedFragments, clientDecrypter)
+	if len(decryptedFragments) == 0 && decryptionErrors > 0 {
+		slog.Error("Failed to decrypt any fragments", "errors", decryptionErrors)
 		return 1
 	}
-	slog.Info("Successfully decrypted fragments", "count", len(decryptedFragments), "required_threshold", threshold)
 
-	// --- Combine Decrypted Fragments ---
-	slog.Info("Attempting to combine decrypted fragments", "count", len(decryptedFragments))
-	reconstructedSecret, err := crypto.CombineFragments(decryptedFragments)
+	// --- Combine and Output ---
+	err = combineAndOutput(decryptedFragments, threshold, getCfg.OutputFile)
 	if err != nil {
-		slog.Error("Failed to combine decrypted fragments", "err", err, "fragments_provided", len(decryptedFragments))
-		// This might indicate an issue with the fragments themselves or the threshold logic
-		return 1
-	}
-	slog.Info("Successfully reconstructed secret")
-
-	// --- Output Secret ---
-	if getCfg.OutputFile == "" || getCfg.OutputFile == "-" {
-		slog.Debug("Writing secret to stdout")
-		_, err = os.Stdout.Write(reconstructedSecret)
-		if err == nil {
-			// Add a newline if writing to stdout for better terminal behavior
-			_, _ = os.Stdout.WriteString("\n")
-		}
-	} else {
-		slog.Info("Writing secret to output file", "path", getCfg.OutputFile)
-		err = os.WriteFile(getCfg.OutputFile, reconstructedSecret, 0o600) // Restrictive permissions
-	}
-
-	if err != nil {
-		slog.Error("Failed to write reconstructed secret", "err", err)
+		slog.Error("Failed to combine fragments or write output", "err", err)
 		return 1
 	}
 
@@ -289,28 +299,22 @@ func Run(getCfg *Config) int {
 	return 0
 }
 
-// findLatestEntry queries targets to find the latest timestamp for a key and returns the full entry.
-// It requires the clientName for authenticating requests to the target nodes.
-// The appCfg parameter is currently unused but kept for potential future use (e.g., master key verification).
-func findLatestEntry(targets []string, key, clientName string, clientSigner tink.Signer, _ *config.Config) (*pb.Entry, string, error) {
+// findLatestTimestampAndSource queries targets to find the latest timestamp for a key and the target holding it.
+func findLatestTimestampAndSource(ctx context.Context, targets []string, key, clientName string, clientSigner tink.Signer) (*timestamppb.Timestamp, string, error) {
 	var latestTimestamp *timestamppb.Timestamp
-	var latestEntry *pb.Entry
 	var sourceTarget string
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	listErrors := make(map[string]error)
 
-	listCtx, listCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer listCancel()
-
-	slog.Info("Querying targets to find latest entry", "key", key, "targets", targets)
+	slog.Info("Querying targets to find latest timestamp", "key", key, "targets", targets)
 
 	for _, target := range targets {
 		wg.Add(1)
 		go func(endpoint string) {
 			defer wg.Done()
 			slog.Debug("Connecting to target for List", "endpoint", endpoint)
-			conn, err := node.DialPeer(listCtx, endpoint)
+			conn, err := node.DialPeer(ctx, endpoint)
 			if err != nil {
 				slog.Warn("Failed to connect to target for List", "endpoint", endpoint, "err", err)
 				mu.Lock()
@@ -325,7 +329,7 @@ func findLatestEntry(targets []string, key, clientName string, clientSigner tink
 			}()
 
 			client := pb.NewSssMemVaultClient(conn)
-			callCtx, callCancel := context.WithTimeout(listCtx, 15*time.Second)
+			callCtx, callCancel := context.WithTimeout(ctx, 15*time.Second)
 			defer callCancel()
 
 			slog.Debug("Calling List on target", "endpoint", endpoint, "client_name", clientName)
@@ -362,36 +366,65 @@ func findLatestEntry(targets []string, key, clientName string, clientSigner tink
 		return nil, "", fmt.Errorf("key %q not found on any target", key)
 	}
 
-	// Now fetch the full entry from the target that had the latest timestamp
-	slog.Info("Fetching full latest entry", "key", key, "timestamp", latestTimestamp.AsTime(), "target", sourceTarget)
-	conn, err := node.DialPeer(listCtx, sourceTarget) // Reuse listCtx
+	return latestTimestamp, sourceTarget, nil
+}
+
+// fetchFullEntry retrieves the complete entry from a specific target.
+func fetchFullEntry(ctx context.Context, targetEndpoint, key, clientName string, timestamp *timestamppb.Timestamp, clientSigner tink.Signer) (*pb.Entry, error) {
+	slog.Info("Fetching full latest entry", "key", key, "timestamp", timestamp.AsTime(), "target", targetEndpoint)
+	conn, err := node.DialPeer(ctx, targetEndpoint)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to connect to target %q to get full entry: %w", sourceTarget, err)
+		return nil, fmt.Errorf("failed to connect to target %q to get full entry: %w", targetEndpoint, err)
 	}
 	defer func() {
 		if err := conn.Close(); err != nil {
-			slog.Warn("Error closing connection to target node during Get", "target", sourceTarget, "err", err)
+			slog.Warn("Error closing connection to target node during Get", "target", targetEndpoint, "err", err)
 		}
 	}()
 
 	client := pb.NewSssMemVaultClient(conn)
-	callCtx, callCancel := context.WithTimeout(listCtx, 15*time.Second)
+	callCtx, callCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer callCancel()
 
-	getRequest := &pb.GetRequest{Key: key, Timestamp: latestTimestamp}
-	slog.Debug("Calling Get on target", "endpoint", sourceTarget, "client_name", clientName, "key", key)
+	getRequest := &pb.GetRequest{Key: key, Timestamp: timestamp}
+	slog.Debug("Calling Get on target", "endpoint", targetEndpoint, "client_name", clientName, "key", key)
 	getResp, err := node.CallGetFromClient(callCtx, client, clientName, clientSigner, getRequest)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to get full entry for key %q from target %q (client %s): %w", key, sourceTarget, clientName, err)
+		return nil, fmt.Errorf("failed to get full entry for key %q from target %q (client %s): %w", key, targetEndpoint, clientName, err)
 	}
 	if getResp == nil || getResp.Entry == nil {
-		return nil, "", fmt.Errorf("received empty response when getting full entry for key %q from target %q", key, sourceTarget)
+		return nil, fmt.Errorf("received empty response when getting full entry for key %q from target %q", key, targetEndpoint)
 	}
 
 	// Optional: Verify master signature again? Store already does this.
 	// err = crypto.VerifyEntrySignature(appCfg.MasterPubKey, getResp.Entry) // Need appCfg for MasterPubKey
 	// if err != nil { ... }
 
-	latestEntry = getResp.Entry
+	return getResp.Entry, nil
+}
+
+// findLatestEntry queries targets to find the latest timestamp for a key and returns the full entry.
+// It requires the clientName for authenticating requests to the target nodes.
+// The appCfg parameter is currently unused but kept for potential future use (e.g., master key verification).
+func findLatestEntry(targets []string, key, clientName string, clientSigner tink.Signer, _ *config.Config) (*pb.Entry, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 1. Find the latest timestamp and the target holding it
+	latestTimestamp, sourceTarget, err := findLatestTimestampAndSource(ctx, targets, key, clientName, clientSigner)
+	if err != nil {
+		return nil, "", err // Error already contains context
+	}
+	if latestTimestamp == nil {
+		// Should have been caught by findLatestTimestampAndSource, but double-check
+		return nil, "", fmt.Errorf("key %q not found (internal error)", key)
+	}
+
+	// 2. Fetch the full entry from the source target
+	latestEntry, err := fetchFullEntry(ctx, sourceTarget, key, clientName, latestTimestamp, clientSigner)
+	if err != nil {
+		return nil, "", err // Error already contains context
+	}
+
 	return latestEntry, sourceTarget, nil
 }

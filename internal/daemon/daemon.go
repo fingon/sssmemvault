@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -27,47 +28,46 @@ type Config struct {
 	// LogLevel is handled globally
 }
 
-// Run starts the sssmemvault daemon.
-func Run(cfg *Config) int {
-	slog.Info("Starting sssmemvaultd daemon...")
-	slog.Info("Using configuration file", "path", cfg.ConfigPath)
+// --- Helper Functions ---
 
-	// --- Load Configuration ---
-	appCfg, err := config.LoadConfig(cfg.ConfigPath)
+// loadDaemonConfig loads the application configuration.
+func loadDaemonConfig(configPath string) (*config.Config, error) {
+	slog.Info("Loading configuration file", "path", configPath)
+	appCfg, err := config.LoadConfig(configPath)
 	if err != nil {
-		slog.Error("Failed to load configuration", "path", cfg.ConfigPath, "err", err)
-		return 1
+		return nil, fmt.Errorf("failed to load configuration: %w", err)
 	}
+	return appCfg, nil
+}
 
-	// --- Initialize Store ---
+// initializeStore creates the in-memory store.
+func initializeStore(appCfg *config.Config) (*store.InMemoryStore, error) {
 	localStore, err := store.NewInMemoryStore(appCfg.MasterPubKey)
 	if err != nil {
-		slog.Error("Failed to initialize in-memory store", "err", err)
-		return 1
+		return nil, fmt.Errorf("failed to initialize in-memory store: %w", err)
 	}
 	slog.Info("In-memory store initialized")
+	return localStore, nil
+}
 
-	// --- Connect to Peers ---
+// connectToPeers establishes connections to configured peers.
+// Returns the map of connected peers and a cleanup function to close connections.
+func connectToPeers(ctx context.Context, appCfg *config.Config, myName string) (map[string]*node.PeerNode, func()) {
 	peerNodes := make(map[string]*node.PeerNode)
-	// Use a separate context for initial peer connections? For now, use background.
-	connectCtx, connectCancel := context.WithTimeout(context.Background(), 30*time.Second) // Timeout for initial connections
+	var wgConnect sync.WaitGroup
+	var mu sync.Mutex // Protect peerNodes map
+
+	connectCtx, connectCancel := context.WithTimeout(ctx, 30*time.Second) // Timeout for initial connections
 	defer connectCancel()
 
-	var wgConnect sync.WaitGroup
-	var mu sync.Mutex // Protect peerNodes map during concurrent connections
-
-	for name, peerCfgPtr := range appCfg.LoadedPeers { // Iterate over LoadedPeers which has pointers
-		// Avoid capturing loop variables directly in goroutine
+	for name, peerCfgPtr := range appCfg.LoadedPeers {
 		localName := name
-		localPeerCfgPtr := peerCfgPtr // Capture the pointer for this iteration
+		localPeerCfgPtr := peerCfgPtr
 
-		// Skip connecting to self if 'my-name' is in the peers list
-		if localName == cfg.MyName {
+		if localName == myName {
 			slog.Debug("Skipping connection to self", "name", localName)
 			continue
 		}
-
-		// Skip peers without an endpoint (likely client entries)
 		if localPeerCfgPtr.Endpoint == "" {
 			slog.Debug("Skipping connection to peer without endpoint", "name", localName)
 			continue
@@ -76,19 +76,18 @@ func Run(cfg *Config) int {
 		wgConnect.Add(1)
 		go func() {
 			defer wgConnect.Done()
-			peerNode, err := node.ConnectToPeer(connectCtx, localName, localPeerCfgPtr) // Pass connectCtx and pointer
+			peerNode, err := node.ConnectToPeer(connectCtx, localName, localPeerCfgPtr)
 			if err == nil {
 				mu.Lock()
 				peerNodes[localName] = peerNode
 				mu.Unlock()
-				// Defer closing connections on shutdown (handled later)
 			}
+			// Error logging happens within ConnectToPeer/DialPeer
 		}()
 	}
-	wgConnect.Wait() // Wait for all initial connection attempts
+	wgConnect.Wait()
 
-	// Defer closing connections
-	defer func() {
+	cleanup := func() {
 		slog.Info("Closing peer connections...")
 		for name, pn := range peerNodes {
 			if pn != nil {
@@ -98,103 +97,147 @@ func Run(cfg *Config) int {
 				}
 			}
 		}
-	}()
-
-	slog.Info("Attempted connections to all configured peers", "connected_count", len(peerNodes), "config_count", len(appCfg.Peers))
-
-	// --- Initialize Synchronizer ---
-	// Pass the map of successfully connected peers and own name
-	syncr, err := synchronizer.NewSynchronizer(appCfg, localStore, peerNodes, cfg.MyName)
-	if err != nil {
-		slog.Error("Failed to initialize synchronizer", "err", err)
-		return 1 // Synchronizer is critical
 	}
 
-	// --- Setup GRPC Server ---
+	slog.Info("Attempted connections to all configured peers", "connected_count", len(peerNodes), "config_count", len(appCfg.Peers))
+	return peerNodes, cleanup
+}
+
+// setupGRPCServer configures and creates the gRPC server instance and listener.
+func setupGRPCServer(appCfg *config.Config, localStore *store.InMemoryStore, myName string) (*grpc.Server, net.Listener, error) {
 	lis, err := net.Listen("tcp", appCfg.ListenAddress)
 	if err != nil {
-		slog.Error("Failed to listen on address", "address", appCfg.ListenAddress, "err", err)
-		return 1
+		return nil, nil, fmt.Errorf("failed to listen on address %s: %w", appCfg.ListenAddress, err)
 	}
 	slog.Info("Listening for GRPC requests", "address", appCfg.ListenAddress)
 
-	// Create GRPC server with interceptor
 	authInterceptor := server.AuthInterceptor(appCfg)
 	grpcServer := grpc.NewServer(
 		grpc.UnaryInterceptor(authInterceptor),
 		// TODO: Add TLS credentials grpc.Creds(...)
 	)
 
-	// Create and register the service implementation
-	sssServer, err := server.NewSssMemVaultServer(localStore, appCfg, cfg.MyName) // Pass MyName from daemon config
+	sssServer, err := server.NewSssMemVaultServer(localStore, appCfg, myName)
 	if err != nil {
-		slog.Error("Failed to create SSS MemVault server implementation", "err", err)
 		_ = lis.Close() // Clean up listener
-		return 1
+		return nil, nil, fmt.Errorf("failed to create SSS MemVault server implementation: %w", err)
 	}
 	pb.RegisterSssMemVaultServer(grpcServer, sssServer)
 	slog.Info("GRPC server configured and service registered")
+	return grpcServer, lis, nil
+}
 
-	// --- Start Services ---
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // Ensure context is cancelled on exit
+// setupSignalHandling sets up handling for SIGINT and SIGTERM.
+func setupSignalHandling() chan os.Signal {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	return signalChan
+}
 
-	// Start synchronizer in background
+// startServices starts the gRPC server and synchronizer in background goroutines.
+func startServices(ctx context.Context, grpcServer *grpc.Server, lis net.Listener, syncr *synchronizer.Synchronizer) chan error {
+	grpcErrChan := make(chan error, 1)
+
+	// Start synchronizer
 	syncr.Start(ctx)
 
-	// Start GRPC server in background
-	grpcErrChan := make(chan error, 1)
+	// Start GRPC server
 	go func() {
 		slog.Info("Starting GRPC server...")
 		grpcErrChan <- grpcServer.Serve(lis)
 	}()
 
-	// --- Handle Shutdown Gracefully ---
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	return grpcErrChan
+}
+
+// handleShutdown orchestrates the graceful shutdown of services.
+func handleShutdown(sig os.Signal, grpcServer *grpc.Server, syncr *synchronizer.Synchronizer, cancel context.CancelFunc) {
+	slog.Info("Received signal, initiating shutdown...", "signal", sig)
+
+	// 1. Stop GRPC server gracefully
+	slog.Info("Attempting graceful GRPC server shutdown...")
+	stopped := make(chan struct{})
+	go func() {
+		grpcServer.GracefulStop()
+		close(stopped)
+	}()
+	stopTimeout := 15 * time.Second
+	select {
+	case <-stopped:
+		slog.Info("GRPC server shut down gracefully")
+	case <-time.After(stopTimeout):
+		slog.Warn("GRPC server graceful shutdown timed out, forcing stop")
+		grpcServer.Stop()
+	}
+
+	// 2. Stop the synchronizer (signal via context cancellation)
+	slog.Info("Stopping synchronizer via context cancellation...")
+	cancel() // Signal synchronizer and other potential background tasks
+
+	// 3. Wait for synchronizer to finish
+	syncr.Stop() // This waits for poll loops to finish
+
+	slog.Info("Shutdown complete.")
+}
+
+// Run starts the sssmemvault daemon.
+func Run(cfg *Config) int {
+	slog.Info("Starting sssmemvaultd daemon...")
+
+	appCfg, err := loadDaemonConfig(cfg.ConfigPath)
+	if err != nil {
+		slog.Error("Initialization failed", "step", "load config", "err", err)
+		return 1
+	}
+
+	localStore, err := initializeStore(appCfg)
+	if err != nil {
+		slog.Error("Initialization failed", "step", "initialize store", "err", err)
+		return 1
+	}
+
+	// Use background context for peer connections and services
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Ensure context is cancelled on exit
+
+	peerNodes, cleanupPeers := connectToPeers(ctx, appCfg, cfg.MyName)
+	defer cleanupPeers() // Ensure connections are closed on exit
+
+	syncr, err := synchronizer.NewSynchronizer(appCfg, localStore, peerNodes, cfg.MyName)
+	if err != nil {
+		slog.Error("Initialization failed", "step", "initialize synchronizer", "err", err)
+		return 1
+	}
+
+	grpcServer, lis, err := setupGRPCServer(appCfg, localStore, cfg.MyName)
+	if err != nil {
+		slog.Error("Initialization failed", "step", "setup gRPC server", "err", err)
+		return 1
+	}
+
+	grpcErrChan := startServices(ctx, grpcServer, lis, syncr)
+	signalChan := setupSignalHandling()
 
 	exitCode := 0 // Default to success
 
+	// Wait for shutdown signal or gRPC server error
 	select {
 	case err := <-grpcErrChan:
-		if err != nil && !errors.Is(err, grpc.ErrServerStopped) { // Ignore ErrServerStopped from graceful stop
+		if err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			slog.Error("GRPC server failed", "err", err)
-			exitCode = 1 // Indicate failure
+			exitCode = 1
 		} else {
 			slog.Info("GRPC server stopped")
 		}
+		// If gRPC stops unexpectedly, cancel context to stop synchronizer
+		cancel()
+		syncr.Stop() // Wait for synchronizer after cancellation
 	case sig := <-signalChan:
-		slog.Info("Received signal, initiating shutdown...", "signal", sig)
-
-		// 1. Stop GRPC server gracefully
-		slog.Info("Attempting graceful GRPC server shutdown...")
-		stopped := make(chan struct{})
-		go func() {
-			grpcServer.GracefulStop()
-			close(stopped)
-		}()
-		// Wait for graceful stop or timeout
-		stopTimeout := 15 * time.Second // Adjust timeout as needed
-		select {
-		case <-stopped:
-			slog.Info("GRPC server shut down gracefully")
-		case <-time.After(stopTimeout):
-			slog.Warn("GRPC server graceful shutdown timed out, forcing stop")
-			grpcServer.Stop() // Force stop
-		}
-
-		// 2. Stop the synchronizer (signal via context cancellation)
-		slog.Info("Stopping synchronizer via context cancellation...")
-		cancel() // Signal synchronizer and other potential background tasks
-
-		// 3. Wait for synchronizer to finish
-		syncr.Stop() // This waits for poll loops to finish
-
-		slog.Info("Shutdown complete.")
+		handleShutdown(sig, grpcServer, syncr, cancel)
 		// Exit code remains 0 for graceful shutdown via signal
 	}
 
-	// Final context cancellation if not already done (e.g., if gRPC server stopped unexpectedly)
+	// Final context cancellation if not already done
 	cancel()
 
 	return exitCode

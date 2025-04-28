@@ -114,16 +114,16 @@ func marshalEntryForSigning(entry *pb.Entry) ([]byte, error) {
 		Timestamp:      &timestamppb.Timestamp{Seconds: entry.Timestamp.Seconds, Nanos: entry.Timestamp.Nanos}, // Ensure deep copy if mutable
 		Key:            entry.Key,
 		Readers:        append([]string(nil), entry.Readers...), // Copy slice
-		OwnerFragments: maps.Clone(entry.OwnerFragments),        // Clone map
+		OwnerFragments: maps.Clone(entry.OwnerFragments),        // Clone map (shallow copy of map, pointers are copied)
 		Threshold:      entry.Threshold,                         // Include threshold
 		// Signature field is explicitly omitted
 	}
 
 	// Marshal the temporary entry. Use deterministic marshalling if available/needed,
 	// but standard proto marshalling is generally stable for the same input struct.
-	data, err := proto.Marshal(entryToSign)
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(entryToSign) // Use deterministic marshalling
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal entry for signing: %w", err)
+		return nil, fmt.Errorf("failed to deterministically marshal entry for signing: %w", err)
 	}
 	// Return a hash of the marshaled data to sign, reducing signature size
 	// and potentially mitigating issues if marshalling isn't perfectly deterministic

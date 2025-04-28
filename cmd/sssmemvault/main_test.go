@@ -184,33 +184,44 @@ func waitForDaemon(t *testing.T, endpoint string, timeout time.Duration) {
 	}
 }
 
-func TestPushAndGetIntegration(t *testing.T) {
-	// Use long test flag if needed: if testing.Short() { t.Skip("Skipping integration test in short mode") }
-	tmpDir := t.TempDir()
-	absTmpDir, err := filepath.Abs(tmpDir) // Get absolute path
-	assert.NilError(t, err)
+// --- Test Helper Functions ---
 
-	// --- Generate Keys (Separate Signing and Hybrid) ---
+// testKeyPaths holds paths to generated keys for a single entity (node/client/master).
+type testKeyPaths struct {
+	SigningPrivate string
+	SigningPublic  string
+	HybridPrivate  string
+	HybridPublic   string
+}
+
+// generateTestKeys generates all necessary keys for the integration test.
+func generateTestKeys(t *testing.T, dir string) (masterKeys, node1Keys, node2Keys, clientKeys testKeyPaths) {
+	t.Helper()
 	// Master key (signing only)
-	masterSigningPriv, masterSigningPub := generateSingleTinkKeyset(t, absTmpDir, "master_signing", signature.ED25519KeyTemplate())
+	masterKeys.SigningPrivate, masterKeys.SigningPublic = generateSingleTinkKeyset(t, dir, "master_signing", signature.ED25519KeyTemplate())
 
 	// Node 1 keys
-	node1SigningPriv, node1SigningPub := generateSingleTinkKeyset(t, absTmpDir, "node1_signing", signature.ECDSAP256KeyTemplate())
-	node1HybridPriv, node1HybridPub := generateSingleTinkKeyset(t, absTmpDir, node1Name+"_hybrid", hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template())
+	node1Keys.SigningPrivate, node1Keys.SigningPublic = generateSingleTinkKeyset(t, dir, node1Name+"_signing", signature.ECDSAP256KeyTemplate())
+	node1Keys.HybridPrivate, node1Keys.HybridPublic = generateSingleTinkKeyset(t, dir, node1Name+"_hybrid", hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template())
 
 	// Node 2 keys
-	node2SigningPriv, node2SigningPub := generateSingleTinkKeyset(t, absTmpDir, node2Name+"_signing", signature.ECDSAP256KeyTemplate())
-	node2HybridPriv, node2HybridPub := generateSingleTinkKeyset(t, absTmpDir, node2Name+"_hybrid", hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template())
+	node2Keys.SigningPrivate, node2Keys.SigningPublic = generateSingleTinkKeyset(t, dir, node2Name+"_signing", signature.ECDSAP256KeyTemplate())
+	node2Keys.HybridPrivate, node2Keys.HybridPublic = generateSingleTinkKeyset(t, dir, node2Name+"_hybrid", hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template())
 
 	// Client keys
-	clientSigningPriv, clientSigningPub := generateSingleTinkKeyset(t, absTmpDir, clientName+"_signing", signature.ECDSAP256KeyTemplate())
-	clientHybridPriv, clientHybridPub := generateSingleTinkKeyset(t, absTmpDir, clientName+"_hybrid", hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template())
+	clientKeys.SigningPrivate, clientKeys.SigningPublic = generateSingleTinkKeyset(t, dir, clientName+"_signing", signature.ECDSAP256KeyTemplate())
+	clientKeys.HybridPrivate, clientKeys.HybridPublic = generateSingleTinkKeyset(t, dir, clientName+"_hybrid", hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template())
 
-	// --- Create Config Files ---
+	return masterKeys, node1Keys, node2Keys, clientKeys
+}
+
+// createTestConfigs creates the necessary config files for nodes and the client.
+func createTestConfigs(t *testing.T, dir string, masterKeys, node1Keys, node2Keys, clientKeys testKeyPaths) (node1CfgPath, node2CfgPath, clientCfgPath string) {
+	t.Helper()
 	// Define peer public key info needed by each node/client config
-	node1PeerKeys := peerKeyPaths{SigningPublic: node1SigningPub, HybridPublic: node1HybridPub}
-	node2PeerKeys := peerKeyPaths{SigningPublic: node2SigningPub, HybridPublic: node2HybridPub}
-	clientPeerKeys := peerKeyPaths{SigningPublic: clientSigningPub, HybridPublic: clientHybridPub}
+	node1PeerKeys := peerKeyPaths{SigningPublic: node1Keys.SigningPublic, HybridPublic: node1Keys.HybridPublic}
+	node2PeerKeys := peerKeyPaths{SigningPublic: node2Keys.SigningPublic, HybridPublic: node2Keys.HybridPublic}
+	clientPeerKeys := peerKeyPaths{SigningPublic: clientKeys.SigningPublic, HybridPublic: clientKeys.HybridPublic}
 
 	// Define all known peers for config generation (using names as keys)
 	allPeers := map[string]peerKeyPaths{
@@ -219,120 +230,127 @@ func TestPushAndGetIntegration(t *testing.T) {
 		clientName: clientPeerKeys,
 	}
 
-	// Peers needed for Node 1's config (all peers)
-	peersForNode1Config := allPeers
-	// Peers needed for Node 2's config (all peers)
-	peersForNode2Config := allPeers
 	// Peers needed for Client's config (only needs actual nodes for endpoint lookup)
 	peersForClientConfig := map[string]peerKeyPaths{
 		node1Name: node1PeerKeys,
 		node2Name: node2PeerKeys,
-		// Client doesn't need its own entry in its config for lookups
 	}
 
-	// Create config files using the new function signature
-	node1CfgPath := createNodeConfig(t, absTmpDir, node1Name, node1Port, node1SigningPriv, node1HybridPriv, masterSigningPub, peersForNode1Config)
-	node2CfgPath := createNodeConfig(t, absTmpDir, node2Name, node2Port, node2SigningPriv, node2HybridPriv, masterSigningPub, peersForNode2Config)
-	// Client config doesn't need its own private keys specified, only master public and peer info
-	clientCfgPath := createNodeConfig(t, absTmpDir, clientName, "", "", "", masterSigningPub, peersForClientConfig)
+	// Create config files
+	node1CfgPath = createNodeConfig(t, dir, node1Name, node1Port, node1Keys.SigningPrivate, node1Keys.HybridPrivate, masterKeys.SigningPublic, allPeers)
+	node2CfgPath = createNodeConfig(t, dir, node2Name, node2Port, node2Keys.SigningPrivate, node2Keys.HybridPrivate, masterKeys.SigningPublic, allPeers)
+	clientCfgPath = createNodeConfig(t, dir, clientName, "", "", "", masterKeys.SigningPublic, peersForClientConfig) // Client config doesn't need its own private keys
 
-	// --- Start Daemons ---
+	return node1CfgPath, node2CfgPath, clientCfgPath
+}
 
-	// Start Node 1
-	cmdNode1 := icmd.Command("go", "run", ".", "daemon",
-		"--config", node1CfgPath,
-		"--my-name", node1Name, // Use --my-name
-		"--loglevel", "debug", // Use debug for more test output
-	)
-	resNode1 := icmd.StartCmd(cmdNode1)
-	t.Logf("Started Node 1 (PID %d)", resNode1.Cmd.Process.Pid)
-	t.Cleanup(func() {
-		t.Log("Cleaning up Node 1...")
-		err := resNode1.Cmd.Process.Signal(syscall.SIGTERM) // Send SIGTERM for graceful shutdown
-		assert.NilError(t, err, "Failed to send SIGTERM to Node 1")
-		// Wait for process to exit, check status
-		state, waitErr := resNode1.Cmd.Process.Wait()
-		assert.NilError(t, waitErr, "Error waiting for Node 1 to exit")
-		t.Logf("Node 1 exited: %s", state)
-		if !state.Success() {
-			t.Logf("Node 1 stderr:\n%s", resNode1.Stderr())
-			t.Logf("Node 1 stdout:\n%s", resNode1.Stdout())
-		}
-		// assert.Assert(t, state.Success(), "Node 1 did not exit successfully") // Allow non-zero exit on SIGTERM
-	})
-
-	// Start Node 2
-	cmdNode2 := icmd.Command("go", "run", ".", "daemon",
-		"--config", node2CfgPath,
-		"--my-name", node2Name, // Use --my-name
+// startTestDaemon starts a daemon process in the background.
+func startTestDaemon(t *testing.T, cfgPath, nodeName string) *icmd.Result {
+	t.Helper()
+	cmd := icmd.Command("go", "run", ".", "daemon",
+		"--config", cfgPath,
+		"--my-name", nodeName,
 		"--loglevel", "debug",
 	)
-	resNode2 := icmd.StartCmd(cmdNode2)
-	t.Logf("Started Node 2 (PID %d)", resNode2.Cmd.Process.Pid)
-	t.Cleanup(func() {
-		t.Log("Cleaning up Node 2...")
-		err := resNode2.Cmd.Process.Signal(syscall.SIGTERM)
-		assert.NilError(t, err, "Failed to send SIGTERM to Node 2")
-		state, waitErr := resNode2.Cmd.Process.Wait()
-		assert.NilError(t, waitErr, "Error waiting for Node 2 to exit")
-		t.Logf("Node 2 exited: %s", state)
-		if !state.Success() {
-			t.Logf("Node 2 stderr:\n%s", resNode2.Stderr())
-			t.Logf("Node 2 stdout:\n%s", resNode2.Stdout())
-		}
-		// assert.Assert(t, state.Success(), "Node 2 did not exit successfully")
-	})
+	res := icmd.StartCmd(cmd)
+	t.Logf("Started %s (PID %d)", nodeName, res.Cmd.Process.Pid)
+	return res
+}
 
-	// --- Wait for Daemons to be Ready ---
-	t.Log("Waiting for daemons to start...")
-	waitForDaemon(t, node1Endpoint, 30*time.Second)
-	waitForDaemon(t, node2Endpoint, 30*time.Second)
-	// Add a small delay for synchronizers to potentially connect/start polling
-	time.Sleep(2 * time.Second)
-	t.Log("Daemons appear ready.")
+// stopTestDaemon stops a daemon process gracefully.
+func stopTestDaemon(t *testing.T, nodeName string, res *icmd.Result) {
+	t.Helper()
+	t.Logf("Cleaning up %s...", nodeName)
+	err := res.Cmd.Process.Signal(syscall.SIGTERM) // Send SIGTERM for graceful shutdown
+	assert.NilError(t, err, "Failed to send SIGTERM to %s", nodeName)
+	// Wait for process to exit, check status
+	state, waitErr := res.Cmd.Process.Wait()
+	assert.NilError(t, waitErr, "Error waiting for %s to exit", nodeName)
+	t.Logf("%s exited: %s", nodeName, state)
+	if !state.Success() {
+		t.Logf("%s stderr:\n%s", nodeName, res.Stderr())
+		t.Logf("%s stdout:\n%s", nodeName, res.Stdout())
+	}
+	// assert.Assert(t, state.Success(), "%s did not exit successfully", nodeName) // Allow non-zero exit on SIGTERM
+}
 
-	// --- Push Secret ---
+// runPushCommand executes the push command.
+func runPushCommand(t *testing.T, masterSigningPriv, node1HybridPub, node2HybridPub string) {
+	t.Helper()
 	t.Log("Pushing secret...")
-	// The push command needs the master *signing* private key and the owners' *hybrid* public keys.
 	pushCmd := icmd.Command("go", "run", ".", "push",
 		"--master-signing-key", masterSigningPriv,
-		"--owner", fmt.Sprintf("%s=%s:%d", node1Name, node1HybridPub, 2), // Assign 2 fragments to Node 1
-		"--owner", fmt.Sprintf("%s=%s:%d", node2Name, node2HybridPub, 2), // Assign 2 fragments to Node 2
-		"--reader", node1Name, // Allow nodes themselves to read for testing simplicity
+		"--owner", fmt.Sprintf("%s=%s:%d", node1Name, node1HybridPub, 2),
+		"--owner", fmt.Sprintf("%s=%s:%d", node2Name, node2HybridPub, 2),
+		"--reader", node1Name,
 		"--reader", node2Name,
-		"--reader", clientName, // Allow client to read
+		"--reader", clientName,
 		"--key", testSecretKey,
 		"--secret", testSecretVal,
-		"--parts", "4", // Use 4 parts
-		"--threshold", "3", // Require 3 parts to reconstruct
-		"--target", node1Endpoint, // Push to both nodes
+		"--parts", "4",
+		"--threshold", "3",
+		"--target", node1Endpoint,
 		"--target", node2Endpoint,
 		"--loglevel", "info",
 	)
 	pushResult := icmd.RunCmd(pushCmd)
 	pushResult.Assert(t, icmd.Success)
 	t.Log("Push command successful.")
+}
 
-	// Allow time for potential synchronization if push only went to one node initially
-	time.Sleep(time.Duration(6) * time.Second) // Wait longer than poll interval
-
-	// --- Get Secret ---
-	// The get command needs the client's name, signing private key, and hybrid private key.
+// runGetCommand executes the get command.
+func runGetCommand(t *testing.T, clientSigningPriv, clientHybridPriv, clientCfgPath, outputFilePath string) {
+	t.Helper()
 	t.Log("Getting secret...")
-	outputFilePath := filepath.Join(absTmpDir, "retrieved_secret.txt")
 	getCmd := icmd.Command("go", "run", ".", "get",
-		"--client-name", clientName, // Provide client name
+		"--client-name", clientName,
 		"--signing-private-key", clientSigningPriv,
 		"--hybrid-private-key", clientHybridPriv,
-		"--config", clientCfgPath, // Use client config to find owner endpoints by name
+		"--config", clientCfgPath,
 		"--key", testSecretKey,
-		"--target", node1Endpoint, // Can target either node to start the process
+		"--target", node1Endpoint, // Target one node to start
 		"--output", outputFilePath,
 		"--loglevel", "info",
 	)
 	getResult := icmd.RunCmd(getCmd)
 	getResult.Assert(t, icmd.Success)
 	t.Log("Get command successful.")
+}
+
+// --- Main Test Function ---
+
+func TestPushAndGetIntegration(t *testing.T) {
+	tmpDir := t.TempDir()
+	absTmpDir, err := filepath.Abs(tmpDir)
+	assert.NilError(t, err)
+
+	// --- Setup: Generate Keys and Configs ---
+	masterKeys, node1Keys, node2Keys, clientKeys := generateTestKeys(t, absTmpDir)
+	node1CfgPath, node2CfgPath, clientCfgPath := createTestConfigs(t, absTmpDir, masterKeys, node1Keys, node2Keys, clientKeys)
+
+	// --- Start Daemons ---
+	resNode1 := startTestDaemon(t, node1CfgPath, node1Name)
+	t.Cleanup(func() { stopTestDaemon(t, node1Name, resNode1) })
+
+	resNode2 := startTestDaemon(t, node2CfgPath, node2Name)
+	t.Cleanup(func() { stopTestDaemon(t, node2Name, resNode2) })
+
+	// --- Wait for Daemons ---
+	t.Log("Waiting for daemons to start...")
+	waitForDaemon(t, node1Endpoint, 30*time.Second)
+	waitForDaemon(t, node2Endpoint, 30*time.Second)
+	time.Sleep(2 * time.Second) // Allow time for initial sync/connection attempts
+	t.Log("Daemons appear ready.")
+
+	// --- Execute Push ---
+	runPushCommand(t, masterKeys.SigningPrivate, node1Keys.HybridPublic, node2Keys.HybridPublic)
+
+	// Allow time for potential synchronization
+	time.Sleep(time.Duration(6) * time.Second) // Wait longer than poll interval
+
+	// --- Execute Get ---
+	outputFilePath := filepath.Join(absTmpDir, "retrieved_secret.txt")
+	runGetCommand(t, clientKeys.SigningPrivate, clientKeys.HybridPrivate, clientCfgPath, outputFilePath)
 
 	// --- Verify Secret ---
 	retrievedBytes, err := os.ReadFile(outputFilePath)
@@ -340,6 +358,6 @@ func TestPushAndGetIntegration(t *testing.T) {
 	assert.Equal(t, string(retrievedBytes), testSecretVal, "Retrieved secret does not match original")
 	t.Log("Secret verification successful.")
 
-	// Cleanup is handled by t.Cleanup calls registered earlier
+	// Cleanup is handled by t.Cleanup calls
 	t.Log("Integration test finished.")
 }

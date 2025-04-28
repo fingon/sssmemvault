@@ -94,92 +94,120 @@ func (self *Synchronizer) pollPeerLoop(ctx context.Context, peerName string, pee
 	}
 }
 
-// syncWithPeer performs a single synchronization cycle with a given peer.
-func (self *Synchronizer) syncWithPeer(ctx context.Context, peerName string, peerNode *node.PeerNode) {
-	slog.Debug("Starting sync cycle with peer", "peer_name", peerName)
-
-	// 1. Get remote list (authenticate using selfName)
+// getRemoteEntries fetches the list of entry metadata from a peer.
+func (self *Synchronizer) getRemoteEntries(ctx context.Context, peerName string, peerNode *node.PeerNode) ([]*pb.EntryMetadata, error) {
 	remoteListResp, err := peerNode.CallList(ctx, self.selfName, self.selfPrivKey)
 	if err != nil {
 		slog.Warn("Failed to get entry list from peer during sync", "peer_name", peerName, "err", err)
-		return // Skip this cycle if List fails
+		return nil, err // Return error to caller
 	}
 	slog.Debug("Received entry list from peer", "peer_name", peerName, "count", len(remoteListResp.Entries))
+	return remoteListResp.Entries, nil
+}
 
-	// 2. Get local list (or map for efficient lookup)
+// getLocalEntryMap builds a map of local entry keys to their timestamps.
+func (self *Synchronizer) getLocalEntryMap() map[string]*timestamppb.Timestamp {
 	localEntries := self.localStore.GetAllEntries() // Get full entries to compare timestamps
 	localEntryMap := make(map[string]*timestamppb.Timestamp, len(localEntries))
 	for _, entry := range localEntries {
 		localEntryMap[entry.Key] = entry.Timestamp
 	}
 	slog.Debug("Built local entry map for comparison", "count", len(localEntryMap))
+	return localEntryMap
+}
+
+// shouldFetchEntry determines if an entry from a peer needs to be fetched.
+func shouldFetchEntry(remoteMeta *pb.EntryMetadata, localEntryMap map[string]*timestamppb.Timestamp, peerName string) bool {
+	localTimestamp, exists := localEntryMap[remoteMeta.Key]
+	if !exists {
+		slog.Debug("Found new entry on peer", "peer_name", peerName, "key", remoteMeta.Key, "timestamp", remoteMeta.Timestamp.AsTime())
+		return true
+	}
+	if remoteMeta.Timestamp.AsTime().After(localTimestamp.AsTime()) {
+		slog.Debug("Found newer entry on peer", "peer_name", peerName, "key", remoteMeta.Key, "remote_ts", remoteMeta.Timestamp.AsTime(), "local_ts", localTimestamp.AsTime())
+		return true
+	}
+	return false
+}
+
+// fetchAndUpdateEntry fetches a specific entry from a peer and updates the local store.
+func (self *Synchronizer) fetchAndUpdateEntry(ctx context.Context, peerName string, peerNode *node.PeerNode, remoteMeta *pb.EntryMetadata) (updated bool, err error) {
+	getRequest := &pb.GetRequest{
+		Key:       remoteMeta.Key,
+		Timestamp: remoteMeta.Timestamp,
+	}
+	// Authenticate Get call using selfName
+	getResponse, err := peerNode.CallGet(ctx, self.selfName, self.selfPrivKey, getRequest)
+	if err != nil {
+		slog.Warn("Failed to get entry details from peer during sync",
+			"peer_name", peerName,
+			"key", remoteMeta.Key,
+			"timestamp", remoteMeta.Timestamp.AsTime(),
+			"err", err)
+		return false, err // Return error
+	}
+
+	// AddOrUpdateEntry handles signature verification internally
+	updated, err = self.localStore.AddOrUpdateEntry(getResponse.Entry)
+	if err != nil {
+		// This usually means the master signature verification failed
+		slog.Warn("Failed to store entry fetched from peer",
+			"peer_name", peerName,
+			"key", remoteMeta.Key,
+			"timestamp", remoteMeta.Timestamp.AsTime(),
+			"err", err)
+		return false, err // Return error
+	}
+
+	if updated {
+		slog.Info("Successfully fetched and stored entry from peer",
+			"peer_name", peerName,
+			"key", remoteMeta.Key,
+			"timestamp", remoteMeta.Timestamp.AsTime())
+	} else {
+		slog.Debug("Fetched entry from peer but did not update local store (likely identical or older)",
+			"peer_name", peerName,
+			"key", remoteMeta.Key,
+			"timestamp", remoteMeta.Timestamp.AsTime())
+	}
+	return updated, nil
+}
+
+// syncWithPeer performs a single synchronization cycle with a given peer.
+func (self *Synchronizer) syncWithPeer(ctx context.Context, peerName string, peerNode *node.PeerNode) {
+	slog.Debug("Starting sync cycle with peer", "peer_name", peerName)
+
+	// 1. Get remote list
+	remoteEntries, err := self.getRemoteEntries(ctx, peerName, peerNode)
+	if err != nil {
+		return // Error already logged
+	}
+
+	// 2. Get local map
+	localEntryMap := self.getLocalEntryMap()
 
 	// 3. Compare and fetch missing/newer entries
 	fetchCount := 0
 	updateCount := 0
 	errorCount := 0
-	for _, remoteMeta := range remoteListResp.Entries {
-		localTimestamp, exists := localEntryMap[remoteMeta.Key]
-
-		shouldFetch := false
-		if !exists {
-			slog.Debug("Found new entry on peer", "peer_name", peerName, "key", remoteMeta.Key, "timestamp", remoteMeta.Timestamp.AsTime())
-			shouldFetch = true
-		} else if remoteMeta.Timestamp.AsTime().After(localTimestamp.AsTime()) {
-			slog.Debug("Found newer entry on peer", "peer_name", peerName, "key", remoteMeta.Key, "remote_ts", remoteMeta.Timestamp.AsTime(), "local_ts", localTimestamp.AsTime())
-			shouldFetch = true
-		}
-
-		if shouldFetch {
+	for _, remoteMeta := range remoteEntries {
+		if shouldFetchEntry(remoteMeta, localEntryMap, peerName) {
 			fetchCount++
-			getRequest := &pb.GetRequest{
-				Key:       remoteMeta.Key,
-				Timestamp: remoteMeta.Timestamp,
-			}
-			// Authenticate Get call using selfName
-			getResponse, err := peerNode.CallGet(ctx, self.selfName, self.selfPrivKey, getRequest)
+			updated, err := self.fetchAndUpdateEntry(ctx, peerName, peerNode, remoteMeta)
 			if err != nil {
-				slog.Warn("Failed to get entry details from peer during sync",
-					"peer_name", peerName,
-					"key", remoteMeta.Key,
-					"timestamp", remoteMeta.Timestamp.AsTime(),
-					"err", err)
 				errorCount++
-				continue // Skip this entry if Get fails
-			}
-
-			// AddOrUpdateEntry handles signature verification internally
-			updated, err := self.localStore.AddOrUpdateEntry(getResponse.Entry)
-			if err != nil {
-				// This usually means the master signature verification failed
-				slog.Warn("Failed to store entry fetched from peer",
-					"peer_name", peerName,
-					"key", remoteMeta.Key,
-					"timestamp", remoteMeta.Timestamp.AsTime(),
-					"err", err)
-				errorCount++
+				// Error already logged in fetchAndUpdateEntry
 				continue
 			}
 			if updated {
 				updateCount++
-				slog.Info("Successfully fetched and stored entry from peer",
-					"peer_name", peerName,
-					"key", remoteMeta.Key,
-					"timestamp", remoteMeta.Timestamp.AsTime())
-			} else {
-				// This could happen if between List and Get, we received an even newer version
-				// from another source, or if timestamps were identical.
-				slog.Debug("Fetched entry from peer but did not update local store (likely identical or older)",
-					"peer_name", peerName,
-					"key", remoteMeta.Key,
-					"timestamp", remoteMeta.Timestamp.AsTime())
 			}
 		}
 	}
 
 	slog.Debug("Finished sync cycle with peer",
 		"peer_name", peerName,
-		"remote_entries", len(remoteListResp.Entries),
+		"remote_entries", len(remoteEntries),
 		"local_entries", len(localEntryMap),
 		"fetched", fetchCount,
 		"updated_local_store", updateCount,

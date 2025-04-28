@@ -5,13 +5,14 @@ import (
 	"errors"
 	"log/slog"
 	"maps"
-	"slices" // Requires Go 1.21+
+	"slices"
 
 	"github.com/fingon/sssmemvault/internal/auth"
 	"github.com/fingon/sssmemvault/internal/config"
 	"github.com/fingon/sssmemvault/internal/crypto"
 	"github.com/fingon/sssmemvault/internal/store"
 	pb "github.com/fingon/sssmemvault/proto"
+	"github.com/tink-crypto/tink-go/v2/tink"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -143,6 +144,97 @@ func (self *SssMemVaultServer) Get(_ context.Context, req *pb.GetRequest) (*pb.G
 	return resp, nil
 }
 
+// --- GetDecoded Helpers ---
+
+// getRequestingNodeName extracts the authenticated node name from the context.
+func getRequestingNodeName(ctx context.Context) (string, error) {
+	requestingNodeNameVal := ctx.Value(auth.GRPCMetadataNodeNameKey)
+	requestingNodeName, ok := requestingNodeNameVal.(string)
+	if !ok || requestingNodeName == "" {
+		// This should not happen if the interceptor ran correctly
+		slog.Error("GetDecoded: failed to get authenticated node name from context")
+		return "", status.Error(codes.Internal, "Failed to identify requesting node")
+	}
+	slog.Debug("GetDecoded: requesting node", "name", requestingNodeName)
+	return requestingNodeName, nil
+}
+
+// authorizeReader checks if the requesting node is authorized to read the entry.
+func authorizeReader(entry *pb.Entry, requestingNodeName string) error {
+	// Requires Go 1.21+ for slices.Contains
+	if !slices.Contains(entry.Readers, requestingNodeName) {
+		slog.Warn("GetDecoded permission denied: requesting node not in readers list",
+			"key", entry.Key,
+			"requesting_node_name", requestingNodeName,
+			"readers", entry.Readers)
+		return status.Errorf(codes.PermissionDenied, "Node %q is not authorized to read key %q", requestingNodeName, entry.Key)
+	}
+	slog.Debug("GetDecoded: reader authorized", "key", entry.Key, "reader_name", requestingNodeName)
+	return nil
+}
+
+// findAndDecryptOwnFragments finds the fragments owned by the current node and decrypts them.
+func (self *SssMemVaultServer) findAndDecryptOwnFragments(entry *pb.Entry) ([][]byte, error) {
+	fragmentList, ok := entry.OwnerFragments[self.nodeName]
+	if !ok || fragmentList == nil || len(fragmentList.Fragments) == 0 {
+		slog.Error("GetDecoded failed: this node does not own a fragment list for the requested entry",
+			"key", entry.Key,
+			"timestamp", entry.Timestamp.AsTime(),
+			"node_name", self.nodeName,
+			"owner_names", maps.Keys(entry.OwnerFragments)) // Requires Go 1.21+ for maps.Keys
+		return nil, status.Errorf(codes.NotFound, "This node (%s) does not hold a fragment list for key %q", self.nodeName, entry.Key)
+	}
+	slog.Debug("GetDecoded: found encrypted fragment list for this node", "key", entry.Key, "node_name", self.nodeName, "fragment_count", len(fragmentList.Fragments))
+
+	decryptedFragments := make([][]byte, 0, len(fragmentList.Fragments))
+	for i, encFrag := range fragmentList.Fragments {
+		decFrag, err := crypto.DecryptFragment(self.cfg.PrivKeyDecrypter, encFrag)
+		if err != nil {
+			slog.Error("GetDecoded failed: could not decrypt one of the owned fragments",
+				"key", entry.Key,
+				"timestamp", entry.Timestamp.AsTime(),
+				"node_name", self.nodeName,
+				"fragment_index", i,
+				"err", err)
+			return nil, status.Errorf(codes.Internal, "Failed to decrypt owned fragment %d for key %q: %v", i, entry.Key, err)
+		}
+		decryptedFragments = append(decryptedFragments, decFrag)
+		slog.Debug("GetDecoded: successfully decrypted owned fragment", "key", entry.Key, "node_name", self.nodeName, "fragment_index", i)
+	}
+	return decryptedFragments, nil
+}
+
+// findRequestorEncrypter finds the hybrid public key encrypter for the requesting node.
+func (self *SssMemVaultServer) findRequestorEncrypter(requestingNodeName string) (tink.HybridEncrypt, error) {
+	requestorPeerCfg, ok := self.cfg.LoadedPeers[requestingNodeName]
+	if !ok || requestorPeerCfg.PubKeyEncrypter == nil {
+		slog.Error("GetDecoded failed: could not find hybrid public key for requesting node",
+			"requesting_node_name", requestingNodeName)
+		return nil, status.Errorf(codes.Internal, "Configuration error: missing hybrid public key for peer %s", requestingNodeName)
+	}
+	slog.Debug("GetDecoded: found hybrid public key for requestor", "requesting_node_name", requestingNodeName)
+	return requestorPeerCfg.PubKeyEncrypter, nil
+}
+
+// reEncryptFragmentsForRequestor re-encrypts the decrypted fragments using the requestor's public key.
+func reEncryptFragmentsForRequestor(decryptedFragments [][]byte, requestorEncrypter tink.HybridEncrypt, key, requestingNodeName string) ([][]byte, error) {
+	fragmentsForRequestor := make([][]byte, 0, len(decryptedFragments))
+	for i, decFrag := range decryptedFragments {
+		encFrag, err := crypto.EncryptFragment(requestorEncrypter, decFrag)
+		if err != nil {
+			slog.Error("GetDecoded failed: could not re-encrypt fragment for requestor",
+				"key", key,
+				"requesting_node_name", requestingNodeName,
+				"fragment_index", i,
+				"err", err)
+			return nil, status.Errorf(codes.Internal, "Failed to re-encrypt fragment %d for requestor %s: %v", i, requestingNodeName, err)
+		}
+		fragmentsForRequestor = append(fragmentsForRequestor, encFrag)
+		slog.Debug("GetDecoded: successfully re-encrypted fragment for requestor", "key", key, "requesting_node_name", requestingNodeName, "fragment_index", i)
+	}
+	return fragmentsForRequestor, nil
+}
+
 // GetDecoded returns the decrypted SSS fragment for the calling node,
 // provided the node is listed in the entry's readers list.
 func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecodedRequest) (*pb.GetDecodedResponse, error) {
@@ -151,15 +243,11 @@ func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecode
 		return nil, status.Error(codes.InvalidArgument, "Key and timestamp are required")
 	}
 
-	// 1. Get Requesting Node Name (from context set by interceptor)
-	requestingNodeNameVal := ctx.Value(auth.GRPCMetadataNodeNameKey)
-	requestingNodeName, ok := requestingNodeNameVal.(string)
-	if !ok || requestingNodeName == "" {
-		// This should not happen if the interceptor ran correctly
-		slog.Error("GetDecoded: failed to get authenticated node name from context")
-		return nil, status.Error(codes.Internal, "Failed to identify requesting node")
+	// 1. Get Requesting Node Name
+	requestingNodeName, err := getRequestingNodeName(ctx)
+	if err != nil {
+		return nil, err // Error already logged and formatted
 	}
-	slog.Debug("GetDecoded: requesting node", "name", requestingNodeName)
 
 	// 2. Get the requested entry from the store
 	entry, err := self.store.GetEntry(req.Key, req.Timestamp)
@@ -168,82 +256,30 @@ func (self *SssMemVaultServer) GetDecoded(ctx context.Context, req *pb.GetDecode
 		return nil, status.Errorf(codes.NotFound, "Entry not found or timestamp mismatch for key %q: %v", req.Key, err)
 	}
 
-	// 3. Check if the requesting node name is in the readers list
-	// Requires Go 1.21+ for slices.Contains
-	if !slices.Contains(entry.Readers, requestingNodeName) {
-		slog.Warn("GetDecoded permission denied: requesting node not in readers list",
-			"key", req.Key,
-			"requesting_node_name", requestingNodeName,
-			"readers", entry.Readers)
-		return nil, status.Errorf(codes.PermissionDenied, "Node %q is not authorized to read key %q", requestingNodeName, req.Key)
-	}
-	slog.Debug("GetDecoded: reader authorized", "key", req.Key, "reader_name", requestingNodeName)
-
-	// 4. Find the encrypted fragment(s) belonging to *this* node (the one handling the request)
-	fragmentList, ok := entry.OwnerFragments[self.nodeName]
-	if !ok || fragmentList == nil || len(fragmentList.Fragments) == 0 {
-		// This means the entry exists, the reader is valid, but this specific node
-		// doesn't own a fragment for this entry, or the list is empty. This shouldn't typically happen
-		// if provisioning is done correctly, but handle it defensively.
-		slog.Error("GetDecoded failed: this node does not own a fragment list for the requested entry",
-			"key", req.Key,
-			"timestamp", req.Timestamp.AsTime(),
-			"node_name", self.nodeName,
-			"owner_names", maps.Keys(entry.OwnerFragments)) // Requires Go 1.21+ for maps.Keys
-		return nil, status.Errorf(codes.NotFound, "This node (%s) does not hold a fragment list for key %q", self.nodeName, req.Key)
-	}
-	slog.Debug("GetDecoded: found encrypted fragment list for this node", "key", req.Key, "node_name", self.nodeName, "fragment_count", len(fragmentList.Fragments))
-
-	// 5. Decrypt *all* fragments owned by this node
-	decryptedFragments := make([][]byte, 0, len(fragmentList.Fragments))
-	for i, encFrag := range fragmentList.Fragments {
-		decFrag, err := crypto.DecryptFragment(self.cfg.PrivKeyDecrypter, encFrag)
-		if err != nil {
-			// Log error but continue processing other fragments if possible.
-			// If even one fails, the client might not be able to reconstruct.
-			slog.Error("GetDecoded failed: could not decrypt one of the owned fragments",
-				"key", req.Key,
-				"timestamp", req.Timestamp.AsTime(),
-				"node_name", self.nodeName,
-				"fragment_index", i,
-				"err", err)
-			// Decide on behavior: return error immediately or try to return partial results?
-			// Returning error immediately is safer.
-			return nil, status.Errorf(codes.Internal, "Failed to decrypt owned fragment %d for key %q: %v", i, req.Key, err)
-		}
-		decryptedFragments = append(decryptedFragments, decFrag)
-		slog.Debug("GetDecoded: successfully decrypted owned fragment", "key", req.Key, "node_name", self.nodeName, "fragment_index", i)
+	// 3. Authorize Reader
+	if err := authorizeReader(entry, requestingNodeName); err != nil {
+		return nil, err // Error already logged and formatted
 	}
 
-	// 6. Find the requesting node's hybrid public key (using its name)
-	requestorPeerCfg, ok := self.cfg.LoadedPeers[requestingNodeName]
-	if !ok || requestorPeerCfg.PubKeyEncrypter == nil {
-		slog.Error("GetDecoded failed: could not find hybrid public key for requesting node",
-			"key", req.Key,
-			"requesting_node_name", requestingNodeName)
-		// This indicates a configuration issue on the server side.
-		return nil, status.Errorf(codes.Internal, "Configuration error: missing hybrid public key for peer %s", requestingNodeName)
-	}
-	requestorEncrypter := requestorPeerCfg.PubKeyEncrypter
-	slog.Debug("GetDecoded: found hybrid public key for requestor", "key", req.Key, "requesting_node_name", requestingNodeName)
-
-	// 7. Re-encrypt *all* decrypted fragments using the requestor's public key
-	fragmentsForRequestor := make([][]byte, 0, len(decryptedFragments))
-	for i, decFrag := range decryptedFragments {
-		encFrag, err := crypto.EncryptFragment(requestorEncrypter, decFrag)
-		if err != nil {
-			slog.Error("GetDecoded failed: could not re-encrypt fragment for requestor",
-				"key", req.Key,
-				"requesting_node_name", requestingNodeName,
-				"fragment_index", i,
-				"err", err)
-			return nil, status.Errorf(codes.Internal, "Failed to re-encrypt fragment %d for requestor %s: %v", i, requestingNodeName, err)
-		}
-		fragmentsForRequestor = append(fragmentsForRequestor, encFrag)
-		slog.Debug("GetDecoded: successfully re-encrypted fragment for requestor", "key", req.Key, "requesting_node_name", requestingNodeName, "fragment_index", i)
+	// 4. Find and Decrypt Fragments Owned by This Node
+	decryptedFragments, err := self.findAndDecryptOwnFragments(entry)
+	if err != nil {
+		return nil, err // Error already logged and formatted
 	}
 
-	// 8. Return the list of re-encrypted fragments
+	// 5. Find Requestor's Public Key Encrypter
+	requestorEncrypter, err := self.findRequestorEncrypter(requestingNodeName)
+	if err != nil {
+		return nil, err // Error already logged and formatted
+	}
+
+	// 6. Re-encrypt Fragments for Requestor
+	fragmentsForRequestor, err := reEncryptFragmentsForRequestor(decryptedFragments, requestorEncrypter, req.Key, requestingNodeName)
+	if err != nil {
+		return nil, err // Error already logged and formatted
+	}
+
+	// 7. Return the list of re-encrypted fragments
 	resp := &pb.GetDecodedResponse{
 		EncryptedFragments: fragmentsForRequestor, // Use the correct field name
 	}

@@ -123,71 +123,20 @@ func loadConfigAndDeriveParams(pushCfg *Config) (*config.Config, error) {
 	return appCfg, nil
 }
 
-// Run executes the push operation.
-func Run(pushCfg *Config) int {
-	slog.Info("Starting push operation...")
-
-	// --- Load Config if specified and derive parameters ---
-	_, err := loadConfigAndDeriveParams(pushCfg)
-	if err != nil {
-		slog.Error("Failed to load or process configuration", "err", err)
-		return 1
-	}
-
-	// --- Validate Inputs (Post-Config Load/Derivation) ---
-	if len(pushCfg.Owners) == 0 {
-		slog.Error("No owners specified. Provide via --owner flags or --config file.")
-		return 1
-	}
-	// Allow parts != owners for round-robin distribution
-	// if pushCfg.Parts != len(pushCfg.Owners) {
-	// 	slog.Error("Number of owners must match the number of parts", "parts", pushCfg.Parts, "owners", len(pushCfg.Owners))
-	// 	return 1
-	// }
-	if pushCfg.Parts <= 0 {
-		slog.Error("Number of parts must be positive", "parts", pushCfg.Parts)
-		return 1
-	}
-	if pushCfg.Threshold > pushCfg.Parts {
-		slog.Error("Threshold cannot be greater than the number of parts", "threshold", pushCfg.Threshold, "parts", pushCfg.Parts)
-		return 1
-	}
-	if pushCfg.Threshold <= 0 {
-		slog.Error("Threshold must be positive", "threshold", pushCfg.Threshold)
-		return 1
-	}
-	if len(pushCfg.Readers) == 0 {
-		slog.Error("At least one reader IP must be specified")
-		return 1
-	}
-	if len(pushCfg.Targets) == 0 {
-		slog.Error("No targets specified. Provide via --target flags or --config file.")
-		return 1
-	}
-
-	// --- Load Master Signing Key ---
-	slog.Debug("Loading master signing private key", "path", pushCfg.MasterSigningPrivateKey)
-	masterSigner, err := crypto.LoadMasterPrivateKeySigner(pushCfg.MasterSigningPrivateKey)
-	if err != nil {
-		slog.Error("Failed to load master signing private key", "path", pushCfg.MasterSigningPrivateKey, "err", err)
-		return 1
-	}
-	slog.Info("Loaded master signing private key successfully")
-
-	// --- Parse Owner Info and Load Keys ---
+// loadOwnerKeys parses owner strings, loads their hybrid public keys, and validates counts.
+func loadOwnerKeys(ownerStrings []string, parts int) ([]*OwnerInfo, map[string]tink.HybridEncrypt, error) {
 	ownerHybridEncrypters := make(map[string]tink.HybridEncrypt) // Map: Name -> Encrypter
-	ownerInfos := make([]*OwnerInfo, 0, len(pushCfg.Owners))
+	ownerInfos := make([]*OwnerInfo, 0, len(ownerStrings))
 	ownerNameSet := make(map[string]struct{}) // To check for duplicate names
 	totalFragmentCountSpecified := 0
-	for _, ownerStr := range pushCfg.Owners {
+
+	for _, ownerStr := range ownerStrings {
 		ownerInfo, err := parseOwner(ownerStr)
 		if err != nil {
-			slog.Error("Failed to parse owner info", "input", ownerStr, "err", err)
-			return 1
+			return nil, nil, fmt.Errorf("failed to parse owner info %q: %w", ownerStr, err)
 		}
 		if _, exists := ownerNameSet[ownerInfo.Name]; exists {
-			slog.Error("Duplicate owner Name specified", "name", ownerInfo.Name)
-			return 1
+			return nil, nil, fmt.Errorf("duplicate owner Name specified: %q", ownerInfo.Name)
 		}
 		ownerNameSet[ownerInfo.Name] = struct{}{}
 		ownerInfos = append(ownerInfos, ownerInfo) // Keep order for fragment assignment
@@ -196,50 +145,49 @@ func Run(pushCfg *Config) int {
 		slog.Debug("Loading owner hybrid public key", "name", ownerInfo.Name, "path", ownerInfo.HybridPublicKey)
 		encrypter, err := crypto.LoadOwnerPublicKeyEncrypter(ownerInfo.HybridPublicKey)
 		if err != nil {
-			slog.Error("Failed to load owner hybrid public key", "name", ownerInfo.Name, "path", ownerInfo.HybridPublicKey, "err", err)
-			return 1
+			return nil, nil, fmt.Errorf("failed to load owner hybrid public key for %q (%s): %w", ownerInfo.Name, ownerInfo.HybridPublicKey, err)
 		}
 		ownerHybridEncrypters[ownerInfo.Name] = encrypter
 		totalFragmentCountSpecified += ownerInfo.Count
 		slog.Info("Loaded owner hybrid public key", "name", ownerInfo.Name, "count", ownerInfo.Count)
 	}
 
-	// --- Validate Total Fragment Count ---
-	if totalFragmentCountSpecified != pushCfg.Parts {
-		slog.Error("Total fragment count specified by owners does not match --parts",
-			"total_specified", totalFragmentCountSpecified,
-			"parts_flag", pushCfg.Parts)
-		return 1
+	// Validate Total Fragment Count
+	if totalFragmentCountSpecified != parts {
+		return nil, nil, fmt.Errorf("total fragment count specified by owners (%d) does not match --parts (%d)",
+			totalFragmentCountSpecified, parts)
 	}
 
-	// --- Split Secret ---
-	slog.Debug("Splitting secret", "parts", pushCfg.Parts, "threshold", pushCfg.Threshold)
-	fragments, err := crypto.SplitSecret([]byte(pushCfg.Secret), pushCfg.Parts, pushCfg.Threshold) // Threshold is int from flags
+	return ownerInfos, ownerHybridEncrypters, nil
+}
+
+// prepareFragments splits the secret and encrypts fragments for each owner.
+func prepareFragments(secret string, parts, threshold int, ownerInfos []*OwnerInfo, ownerHybridEncrypters map[string]tink.HybridEncrypt) (map[string]*pb.FragmentList, error) {
+	slog.Debug("Splitting secret", "parts", parts, "threshold", threshold)
+	fragments, err := crypto.SplitSecret([]byte(secret), parts, threshold)
 	if err != nil {
-		slog.Error("Failed to split secret", "err", err)
-		return 1
+		return nil, fmt.Errorf("failed to split secret: %w", err)
 	}
 	slog.Info("Secret split into fragments", "count", len(fragments))
 
-	// --- Encrypt Fragments ---
-	// Map: Owner Name -> List of Encrypted Fragments
+	// Encrypt Fragments
 	ownerEncryptedFragments := make(map[string]*pb.FragmentList)
 	numOwners := len(ownerInfos)
 	if numOwners == 0 {
-		// Should have been caught by validation, but double-check
-		slog.Error("Internal error: No owner info available for fragment encryption")
-		return 1
+		return nil, errors.New("internal error: No owner info available for fragment encryption")
 	}
-	if len(fragments) != pushCfg.Parts {
-		// This should not happen if SplitSecret worked correctly
-		slog.Error("Internal error: fragment count mismatch", "fragments", len(fragments), "expected_parts", pushCfg.Parts)
-		return 1
+	if len(fragments) != parts {
+		return nil, fmt.Errorf("internal error: fragment count mismatch (%d) vs expected parts (%d)", len(fragments), parts)
 	}
 
 	slog.Info("Encrypting and distributing fragments according to owner counts", "fragment_count", len(fragments), "owner_count", numOwners)
 	fragmentIndex := 0
 	for _, ownerInfo := range ownerInfos {
-		encrypter := ownerHybridEncrypters[ownerInfo.Name]
+		encrypter, ok := ownerHybridEncrypters[ownerInfo.Name]
+		if !ok {
+			// Should not happen if loadOwnerKeys worked correctly
+			return nil, fmt.Errorf("internal error: missing encrypter for owner %q", ownerInfo.Name)
+		}
 		slog.Debug("Assigning fragments to owner", "owner_name", ownerInfo.Name, "count", ownerInfo.Count)
 
 		// Initialize the list for this owner
@@ -247,21 +195,15 @@ func Run(pushCfg *Config) int {
 
 		for range ownerInfo.Count {
 			if fragmentIndex >= len(fragments) {
-				// Should have been caught by validation, but safeguard
-				slog.Error("Internal error: Not enough fragments generated for distribution", "needed", totalFragmentCountSpecified, "generated", len(fragments))
-				return 1
+				return nil, fmt.Errorf("internal error: Not enough fragments generated for distribution (needed %d, generated %d)", parts, len(fragments))
 			}
 			fragment := fragments[fragmentIndex]
 
 			slog.Debug("Encrypting fragment for owner", "fragment_index", fragmentIndex, "assigned_owner_name", ownerInfo.Name)
 			encrypted, err := crypto.EncryptFragment(encrypter, fragment)
 			if err != nil {
-				slog.Error("Failed to encrypt fragment",
-					"fragment_index", fragmentIndex,
-					"assigned_owner_name", ownerInfo.Name,
-					"hybrid_key_path", ownerInfo.HybridPublicKey,
-					"err", err)
-				return 1
+				return nil, fmt.Errorf("failed to encrypt fragment %d for owner %q (%s): %w",
+					fragmentIndex, ownerInfo.Name, ownerInfo.HybridPublicKey, err)
 			}
 
 			// Append the encrypted fragment to the list for this owner
@@ -272,12 +214,14 @@ func Run(pushCfg *Config) int {
 	}
 	// Sanity check: ensure all fragments were assigned
 	if fragmentIndex != len(fragments) {
-		slog.Error("Internal error: Fragment count mismatch after distribution", "assigned", fragmentIndex, "total", len(fragments))
-		return 1
+		return nil, fmt.Errorf("internal error: Fragment count mismatch after distribution (assigned %d, total %d)", fragmentIndex, len(fragments))
 	}
 	slog.Info("Finished encrypting and distributing fragments")
+	return ownerEncryptedFragments, nil
+}
 
-	// --- Construct Entry ---
+// buildAndSignEntry constructs the protobuf Entry and signs it.
+func buildAndSignEntry(pushCfg *Config, ownerEncryptedFragments map[string]*pb.FragmentList, masterSigner tink.Signer) (*pb.Entry, error) {
 	entry := &pb.Entry{
 		Timestamp:      timestamppb.Now(),
 		Key:            pushCfg.Key,
@@ -288,34 +232,31 @@ func Run(pushCfg *Config) int {
 	}
 	slog.Debug("Constructed entry structure", "key", entry.Key, "timestamp", entry.Timestamp.AsTime(), "threshold", entry.Threshold)
 
-	// --- Sign Entry ---
+	// Sign Entry
 	slog.Debug("Signing entry with master key")
-	err = crypto.SignEntry(masterSigner, entry)
+	err := crypto.SignEntry(masterSigner, entry)
 	if err != nil {
-		slog.Error("Failed to sign entry", "err", err)
-		return 1
+		return nil, fmt.Errorf("failed to sign entry: %w", err)
 	}
 	slog.Info("Entry signed successfully")
+	return entry, nil
+}
 
-	// --- Push to Targets ---
+// pushEntryToTargets pushes the signed entry to all target nodes concurrently.
+func pushEntryToTargets(targets []string, entry *pb.Entry) (successCount, errorCount int) {
 	pushRequest := &pb.PushRequest{Entry: entry}
 	var wg sync.WaitGroup
-	successCount := 0
-	errorCount := 0
 	var mu sync.Mutex // To protect counters
 
 	// Use a shared context for all push operations
 	pushCtx, pushCancel := context.WithTimeout(context.Background(), 60*time.Second) // Overall timeout for pushing
 	defer pushCancel()
 
-	for _, target := range pushCfg.Targets {
+	for _, target := range targets {
 		wg.Add(1)
 		go func(targetEndpoint string) {
 			defer wg.Done()
 			slog.Info("Connecting to target node", "endpoint", targetEndpoint)
-			// Use node.ConnectToPeer for consistency, though we don't need the full PeerNode struct here
-			// We need a client connection. Let's simplify for push.
-			// TODO: Refactor connection logic to be more reusable.
 			conn, err := node.DialPeer(pushCtx, targetEndpoint) // Use a simplified dial function
 			if err != nil {
 				slog.Error("Failed to connect to target", "endpoint", targetEndpoint, "err", err)
@@ -336,15 +277,15 @@ func Run(pushCfg *Config) int {
 			callCtx, callCancel := context.WithTimeout(pushCtx, 30*time.Second)
 			defer callCancel()
 
-			slog.Info("Pushing entry to target", "endpoint", targetEndpoint, "key", pushCfg.Key)
+			slog.Info("Pushing entry to target", "endpoint", targetEndpoint, "key", entry.Key)
 			_, err = client.Push(callCtx, pushRequest) // Use callCtx
 
 			mu.Lock()
 			if err != nil {
-				slog.Error("Failed to push entry to target", "endpoint", targetEndpoint, "key", pushCfg.Key, "err", err)
+				slog.Error("Failed to push entry to target", "endpoint", targetEndpoint, "key", entry.Key, "err", err)
 				errorCount++
 			} else {
-				slog.Info("Successfully pushed entry to target", "endpoint", targetEndpoint, "key", pushCfg.Key)
+				slog.Info("Successfully pushed entry to target", "endpoint", targetEndpoint, "key", entry.Key)
 				successCount++
 			}
 			mu.Unlock()
@@ -353,6 +294,78 @@ func Run(pushCfg *Config) int {
 
 	wg.Wait()
 	slog.Info("Push operation complete", "successful_targets", successCount, "failed_targets", errorCount)
+	return successCount, errorCount
+}
+
+// Run executes the push operation.
+func Run(pushCfg *Config) int {
+	slog.Info("Starting push operation...")
+
+	// --- Load Config if specified and derive parameters ---
+	_, err := loadConfigAndDeriveParams(pushCfg)
+	if err != nil {
+		slog.Error("Failed to load or process configuration", "err", err)
+		return 1
+	}
+
+	// --- Validate Inputs (Post-Config Load/Derivation) ---
+	if len(pushCfg.Owners) == 0 {
+		slog.Error("No owners specified. Provide via --owner flags or --config file.")
+		return 1
+	}
+	if pushCfg.Parts <= 0 {
+		slog.Error("Number of parts must be positive", "parts", pushCfg.Parts)
+		return 1
+	}
+	if pushCfg.Threshold > pushCfg.Parts {
+		slog.Error("Threshold cannot be greater than the number of parts", "threshold", pushCfg.Threshold, "parts", pushCfg.Parts)
+		return 1
+	}
+	if pushCfg.Threshold <= 0 {
+		slog.Error("Threshold must be positive", "threshold", pushCfg.Threshold)
+		return 1
+	}
+	if len(pushCfg.Readers) == 0 {
+		slog.Error("At least one reader must be specified")
+		return 1
+	}
+	if len(pushCfg.Targets) == 0 {
+		slog.Error("No targets specified. Provide via --target flags or --config file.")
+		return 1
+	}
+
+	// --- Load Master Signing Key ---
+	slog.Debug("Loading master signing private key", "path", pushCfg.MasterSigningPrivateKey)
+	masterSigner, err := crypto.LoadMasterPrivateKeySigner(pushCfg.MasterSigningPrivateKey)
+	if err != nil {
+		slog.Error("Failed to load master signing private key", "path", pushCfg.MasterSigningPrivateKey, "err", err)
+		return 1
+	}
+	slog.Info("Loaded master signing private key successfully")
+
+	// --- Parse Owner Info and Load Keys ---
+	ownerInfos, ownerHybridEncrypters, err := loadOwnerKeys(pushCfg.Owners, pushCfg.Parts)
+	if err != nil {
+		slog.Error("Failed to load owner keys or validate counts", "err", err)
+		return 1
+	}
+
+	// --- Split Secret and Encrypt Fragments ---
+	ownerEncryptedFragments, err := prepareFragments(pushCfg.Secret, pushCfg.Parts, pushCfg.Threshold, ownerInfos, ownerHybridEncrypters)
+	if err != nil {
+		slog.Error("Failed to prepare fragments", "err", err)
+		return 1
+	}
+
+	// --- Construct and Sign Entry ---
+	entry, err := buildAndSignEntry(pushCfg, ownerEncryptedFragments, masterSigner)
+	if err != nil {
+		slog.Error("Failed to build or sign entry", "err", err)
+		return 1
+	}
+
+	// --- Push to Targets ---
+	_, errorCount := pushEntryToTargets(pushCfg.Targets, entry)
 
 	if errorCount > 0 {
 		return 1 // Exit with error if any push failed
