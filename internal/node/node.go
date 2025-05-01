@@ -50,11 +50,19 @@ func DialPeer(_ context.Context, endpoint string) (*grpc.ClientConn, error) {
 // ConnectToPeer establishes a GRPC connection to a peer node using its config.
 // Used primarily by the daemon/synchronizer. Includes context for timeout.
 func ConnectToPeer(ctx context.Context, name string, peerCfg *config.PeerConfig) (*PeerNode, error) {
-	if peerCfg == nil || peerCfg.Endpoint == "" {
-		return nil, fmt.Errorf("invalid or missing peer config for name %s", name)
-	}
 	if name == "" {
 		return nil, errors.New("peer name cannot be empty")
+	}
+	if peerCfg == nil {
+		return nil, fmt.Errorf("missing peer config for name %s", name)
+	}
+	// Endpoint is required for connection, but public key path is needed for operations
+	if peerCfg.Endpoint == "" {
+		return nil, fmt.Errorf("peer config for %s is missing endpoint", name)
+	}
+	if peerCfg.PublicKeyPath == "" {
+		// This should be caught by config loading, but check defensively
+		return nil, fmt.Errorf("peer config for %s is missing public_key_path", name)
 	}
 
 	slog.Info("Connecting to peer", "name", name, "endpoint", peerCfg.Endpoint)
@@ -70,7 +78,7 @@ func ConnectToPeer(ctx context.Context, name string, peerCfg *config.PeerConfig)
 
 	node := &PeerNode{
 		Name:   name,
-		Config: peerCfg,
+		Config: peerCfg, // Store the pointer to the config containing loaded keys
 		Conn:   conn,
 		Client: client,
 	}
@@ -81,7 +89,7 @@ func ConnectToPeer(ctx context.Context, name string, peerCfg *config.PeerConfig)
 // Close closes the GRPC connection to the peer.
 func (self *PeerNode) Close() error {
 	if self.Conn != nil {
-		slog.Info("Closing connection to peer", "name", self.Name, "endpoint", self.Config.Endpoint)
+		slog.Info("Closing connection to peer", "name", self.Name, "endpoint", self.Config.Endpoint) // Use endpoint from config
 		return self.Conn.Close()
 	}
 	return nil
@@ -94,6 +102,9 @@ func (self *PeerNode) Close() error {
 func createAuthenticatedContext(ctx context.Context, clientName string, selfPrivKey tink.Signer) (context.Context, error) {
 	if clientName == "" {
 		return nil, errors.New("client name cannot be empty for authenticated context")
+	}
+	if selfPrivKey == nil {
+		return nil, errors.New("private key signer cannot be nil for authenticated context")
 	}
 	now := time.Now().UTC()
 	// Use RFC3339Nano for precision, compatible with Go's default time.Time marshalling

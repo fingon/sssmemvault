@@ -35,6 +35,10 @@ func NewSssMemVaultServer(s *store.InMemoryStore, cfg *config.Config, myName str
 	if cfg == nil {
 		return nil, errors.New("config cannot be nil")
 	}
+	// Daemon needs both signer (for sync calls) and decrypter (for GetDecoded)
+	if cfg.PrivKeySigner == nil {
+		return nil, errors.New("config is missing private key signer")
+	}
 	if cfg.PrivKeyDecrypter == nil {
 		return nil, errors.New("config is missing private key decrypter")
 	}
@@ -204,15 +208,20 @@ func (self *SssMemVaultServer) findAndDecryptOwnFragments(entry *pb.Entry) ([][]
 	return decryptedFragments, nil
 }
 
-// findRequestorEncrypter finds the hybrid public key encrypter for the requesting node.
+// findRequestorEncrypter finds the public key encrypter for the requesting node from the loaded config.
 func (self *SssMemVaultServer) findRequestorEncrypter(requestingNodeName string) (tink.HybridEncrypt, error) {
 	requestorPeerCfg, ok := self.cfg.LoadedPeers[requestingNodeName]
-	if !ok || requestorPeerCfg.PubKeyEncrypter == nil {
-		slog.Error("GetDecoded failed: could not find hybrid public key for requesting node",
-			"requesting_node_name", requestingNodeName)
-		return nil, status.Errorf(codes.Internal, "Configuration error: missing hybrid public key for peer %s", requestingNodeName)
+	if !ok {
+		slog.Error("GetDecoded failed: could not find config entry for requesting node", "requesting_node_name", requestingNodeName)
+		return nil, status.Errorf(codes.Internal, "Configuration error: missing config for peer %s", requestingNodeName)
 	}
-	slog.Debug("GetDecoded: found hybrid public key for requestor", "requesting_node_name", requestingNodeName)
+	if requestorPeerCfg.PubKeyEncrypter == nil {
+		// This should not happen if config loading succeeded for this peer
+		slog.Error("GetDecoded failed: could not find loaded public key encrypter for requesting node",
+			"requesting_node_name", requestingNodeName, "public_key_path", requestorPeerCfg.PublicKeyPath)
+		return nil, status.Errorf(codes.Internal, "Configuration error: missing public key encrypter for peer %s (path: %s)", requestingNodeName, requestorPeerCfg.PublicKeyPath)
+	}
+	slog.Debug("GetDecoded: found public key encrypter for requestor", "requesting_node_name", requestingNodeName)
 	return requestorPeerCfg.PubKeyEncrypter, nil
 }
 

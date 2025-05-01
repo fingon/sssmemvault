@@ -181,12 +181,18 @@ func handleShutdown(sig os.Signal, grpcServer *grpc.Server, syncr *synchronizer.
 }
 
 // Run starts the sssmemvault daemon.
-func Run(cfg *Config) int {
+func Run(daemonCfg *Config) int {
 	slog.Info("Starting sssmemvaultd daemon...")
 
-	appCfg, err := loadDaemonConfig(cfg.ConfigPath)
+	appCfg, err := loadDaemonConfig(daemonCfg.ConfigPath)
 	if err != nil {
 		slog.Error("Initialization failed", "step", "load config", "err", err)
+		return 1
+	}
+
+	// Validate that the required keys were loaded for the daemon
+	if appCfg.PrivKeySigner == nil || appCfg.PrivKeyDecrypter == nil {
+		slog.Error("Initialization failed: Daemon requires both signing and decryption keys loaded from private_key_path", "path", appCfg.PrivateKeyPath)
 		return 1
 	}
 
@@ -200,16 +206,16 @@ func Run(cfg *Config) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // Ensure context is cancelled on exit
 
-	peerNodes, cleanupPeers := connectToPeers(ctx, appCfg, cfg.MyName)
+	peerNodes, cleanupPeers := connectToPeers(ctx, appCfg, daemonCfg.MyName)
 	defer cleanupPeers() // Ensure connections are closed on exit
 
-	syncr, err := synchronizer.NewSynchronizer(appCfg, localStore, peerNodes, cfg.MyName)
+	syncr, err := synchronizer.NewSynchronizer(appCfg, localStore, peerNodes, daemonCfg.MyName)
 	if err != nil {
 		slog.Error("Initialization failed", "step", "initialize synchronizer", "err", err)
 		return 1
 	}
 
-	grpcServer, lis, err := setupGRPCServer(appCfg, localStore, cfg.MyName)
+	grpcServer, lis, err := setupGRPCServer(appCfg, localStore, daemonCfg.MyName)
 	if err != nil {
 		slog.Error("Initialization failed", "step", "setup gRPC server", "err", err)
 		return 1

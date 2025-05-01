@@ -42,9 +42,9 @@ func VerifyRequest(requestingNodeName, requestTimestampStr, signatureB64 string,
 
 	// 2. Check Public Key Verifier (essential for signature check)
 	if peerCfg.PubKeyVerifier == nil {
-		// This should not happen if config loading is correct and peer was found
-		slog.Error("Internal error: peer config found but public key verifier is nil", "configured_peer_name", requestingNodeName)
-		return fmt.Errorf("internal error: missing public key for peer %s", requestingNodeName)
+		// This should not happen if config loading succeeded for this peer
+		slog.Error("Internal error: peer config found but public key verifier is nil", "configured_peer_name", requestingNodeName, "public_key_path", peerCfg.PublicKeyPath)
+		return fmt.Errorf("internal error: missing public key verifier for peer %s (path: %s)", requestingNodeName, peerCfg.PublicKeyPath)
 	}
 
 	// 3. Parse Timestamp

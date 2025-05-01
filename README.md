@@ -27,27 +27,26 @@ timestamp wins.
 - Each participating node listens to insecure GRPC HTTP requests on
   (default) port 59240.
 
-- Each node/client has a unique **name** (string) and a corresponding *signing* private key.
-- Each node also has a *hybrid* key pair for fragment encryption/decryption.
-- Each node has all other nodes' (and relevant clients') public keys (signing and hybrid) and their names mapped in its configuration file (`peers` section).
+- Each node/client has a unique **name** (string) and a corresponding combined keyset (private and public).
+- The private keyset contains both a *signing* private key and a *hybrid* private key.
+- The public keyset contains both a *signing* public key and a *hybrid* public key.
+- Each node has all other nodes' (and relevant clients') public keysets (`public_key_path`) and their names mapped in its configuration file (`peers` section).
 - Authenticated GRPC requests (List, Get, GetDecoded) must contain headers with:
     - The requesting node/client's **name** (`x-request-node-name`).
     - A recent timestamp (`x-request-timestamp`).
-    - A signature over the timestamp, created using the requestor's *signing* private key (`x-request-signature`).
-- The receiving node verifies the signature using the public key associated with the provided name in its configuration.
+    - A signature over the timestamp, created using the requestor's *signing* private key (extracted from their combined private keyset) (`x-request-signature`).
+- The receiving node verifies the signature using the *signing* public key (extracted from the public keyset associated with the provided name in its configuration).
 
 
 ## Configuration file (for each node) ##
 
-- path to their *signing* private key file (`signing_private_key_path`)
-- path to their *hybrid* private key file (`hybrid_private_key_path`)
-- path to the *master signing* public key file (`master_signing_public_key`)
+- path to their combined *private* keyset file (`private_key_path`) containing both signing and hybrid private keys.
+- path to the *master signing* public key file (`master_public_key_path`) - this remains a signing-only key.
 - listen address (`listen_address`)
 - max timestamp skew (`max_timestamp_skew`)
 - map of peer nodes (`peers`), where the key is the peer's unique **name** (string) and the value contains:
   - `endpoint`: GRPC endpoint (host:port)
-  - `signing_public_key`: Path to the peer's public key for verifying their requests.
-  - `hybrid_public_key`: Path to the peer's public key for encrypting data *for* them (used by `push` and `GetDecoded`).
+  - `public_key_path`: Path to the peer's combined *public* keyset file (containing signing and hybrid public keys). Used for verifying their requests and encrypting data *for* them.
   - `poll_interval` (optional): Go duration string (e.g., `60s`), indicating this peer should be polled for updates.
 
 ## Requests ##
@@ -58,7 +57,7 @@ timestamp wins.
 
 - Get decoded (timestamp, key) request: Returns the decrypted
   owner-specific SSS fragment(s), re-encrypted using the requesting
-  node's hybrid public key, if the requesting node **name** is in the
+  node's *hybrid public key* (extracted from their public keyset), if the requesting node **name** is in the
   entry's `readers` list.
 
 ## Implementation ##
@@ -75,10 +74,11 @@ This creates the `sssmemvault` binary.
 
 ## Commands ##
 
-The `sssmemvault` tool has three subcommands:
+The `sssmemvault` tool has four subcommands:
 
-*   `daemon`: Runs the sssmemvault node.
-*   `push`: Creates and pushes a new secret entry to nodes.
+*   `genkeys`: Generates combined private and public keyset files for a node or client.
+*   `daemon`: Runs the sssmemvault daemon node.
+*   `push`: Creates and pushes a new secret entry to nodes (owners derived from config).
 *   `get`: Retrieves and reconstructs a secret from nodes.
 
 Use `sssmemvault <command> --help` for details on each subcommand's flags.
@@ -87,83 +87,57 @@ Use `sssmemvault <command> --help` for details on each subcommand's flags.
 
 This example demonstrates setting up two nodes (`node-A`, `node-B`) and a client (`client-X`) and using the commands.
 
-We will use Tink's command-line tool `tinkey` to generate the necessary keys. You might need to install `tinkey` first (e.g., via Go install or pre-built binaries). Node endpoints are assumed to be `node-a.example.com:59240` and `node-b.example.com:59240`.
+We will use the `sssmemvault genkeys` command to generate the necessary combined keysets. Node endpoints are assumed to be `node-a.example.com:59240` and `node-b.example.com:59240`.
 
 **1. Generate Master Key Pair (Signing Only)**
 
-Only the master *signing* public key is needed by the nodes. Keep the master *signing* private key secure and offline (used only by `sssmemvault push`). We'll use ED25519.
+Only the master *signing* public key is needed by the nodes. Keep the master *signing* private key secure and offline (used only by `sssmemvault push`). We'll use Tink's `tinkey` tool for this specific key as `sssmemvault genkeys` creates combined keys. We'll use ED25519.
 
 ```bash
 # Generate master signing private key
-tinkey create-keyset --key-template ED25519 --out master_signing_private.json
+tinkey create-keyset --key-template ED25519 --out master_private.json
 # Extract master signing public key
-tinkey create-public-keyset --in master_signing_private.json --out master_signing_public.json
+tinkey create-public-keyset --in master_private.json --out master_public.json
 ```
 
-**2. Generate Node 1 Key Pairs (Signing + Hybrid)**
+**2. Generate Node A Combined Keyset**
 
-Nodes need *separate* keysets: one for signing requests (e.g., ECDSA_P256) and one for hybrid encryption/decryption (e.g., DHKEM_X25519_HKDF_SHA256_AES_256_GCM).
+Use the new `sssmemvault genkeys` command.
 
 ```bash
-# --- Node A Signing Key ---
-# Generate Node A signing private key
-tinkey create-keyset --key-template ECDSA_P256 --out nodeA_signing_private.json
-# Extract Node A signing public key
-tinkey create-public-keyset --in nodeA_signing_private.json --out nodeA_signing_public.json
-
-# --- Node A Hybrid Key ---
-# Generate Node A hybrid private key
-tinkey create-keyset --key-template DHKEM_X25519_HKDF_SHA256_AES_256_GCM --out nodeA_hybrid_private.json
-# Extract Node A hybrid public key
-tinkey create-public-keyset --in nodeA_hybrid_private.json --out nodeA_hybrid_public.json
+./sssmemvault genkeys \
+  --private-out nodeA_private.json \
+  --public-out nodeA_public.json
 ```
 
-**3. Generate Node B Key Pairs**
-
-Repeat the process for Node B, creating:
-*   `nodeB_signing_private.json` / `nodeB_signing_public.json`
-*   `nodeB_hybrid_private.json` / `nodeB_hybrid_public.json`
+**3. Generate Node B Combined Keyset**
 
 ```bash
-# --- Node B Signing Key ---
-tinkey create-keyset --key-template ECDSA_P256 --out nodeB_signing_private.json
-tinkey create-public-keyset --in nodeB_signing_private.json --out nodeB_signing_public.json
-
-# --- Node B Hybrid Key ---
-tinkey create-keyset --key-template DHKEM_X25519_HKDF_SHA256_AES_256_GCM --out nodeB_hybrid_private.json
-tinkey create-public-keyset --in nodeB_hybrid_private.json --out nodeB_hybrid_public.json
+./sssmemvault genkeys \
+  --private-out nodeB_private.json \
+  --public-out nodeB_public.json
 ```
 
-**4. Generate Client Key Pairs (Signing + Hybrid)**
-
-The client (`client-X` in this example) needs its own *signing* private key to authenticate `get` requests and its *hybrid* private key to decrypt the fragments returned by `GetDecoded`. The corresponding public keys need to be known by the nodes (via the config file).
+**4. Generate Client Combined Keyset**
 
 ```bash
-# --- Client X Signing Key ---
-# Generate Client signing private key
-tinkey create-keyset --key-template ECDSA_P256 --out clientX_signing_private.json
-# Extract Client signing public key
-tinkey create-public-keyset --in clientX_signing_private.json --out clientX_signing_public.json
-
-# --- Client X Hybrid Key ---
-tinkey create-keyset --key-template DHKEM_X25519_HKDF_SHA256_AES_256_GCM --out clientX_hybrid_private.json
-tinkey create-public-keyset --in clientX_hybrid_private.json --out clientX_hybrid_public.json
+./sssmemvault genkeys \
+  --private-out clientX_private.json \
+  --public-out clientX_public.json
 ```
 
 **5. Create Configuration File (`config.yaml`)**
 
-This file is used by the `daemon` command and optionally by `push` and `get` to find peers/targets. Place the generated public keys (`master_signing_public.json`, `nodeA_signing_public.json`, `nodeA_hybrid_public.json`, etc.) and the respective private keys (`nodeA_signing_private.json`, `nodeA_hybrid_private.json`, etc.) where the nodes can access them. The client needs its own private keys (`clientX_signing_private.json`, `clientX_hybrid_private.json`).
+This file is used by the `daemon` command and is **required** by `push` and `get`. Place the generated keysets where the nodes/clients can access them.
 
 ```yaml
 # config.yaml
 
 # --- Daemon Settings ---
-# Path to the private key file for signing outgoing requests.
-signing_private_key_path: "node_signing_private.json" # Node A uses nodeA_signing_private.json, Node B uses nodeB_signing_private.json
-# Path to the private key file for decrypting owned SSS fragments.
-hybrid_private_key_path: "node_hybrid_private.json" # Node A uses nodeA_hybrid_private.json, Node B uses nodeB_hybrid_private.json
-# Path to the master public key file (used to verify pushed entry signatures).
-master_signing_public_key: "master_signing_public.json"
+# Path to the node's combined private keyset file (signing + hybrid).
+private_key_path: "node_private.json" # Node A uses nodeA_private.json, Node B uses nodeB_private.json
+# Path to the master public key file (signing only, used to verify pushed entry signatures).
+master_public_key_path: "master_public.json"
 # Address and port the daemon listens on.
 listen_address: ":59240"
 # Maximum allowed time difference for authenticated requests.
@@ -172,28 +146,25 @@ max_timestamp_skew: 30s
 # --- Peer Information ---
 # Map of peer **names** (arbitrary strings) to their configuration.
 # The daemon uses this to know about other nodes for synchronization and auth verification.
-# Client commands ('push', 'get') can use this to find targets/owners if not specified via flags.
+# Client commands ('push', 'get') use this to find targets/owners and their public keys.
 peers:
   # Configuration for Node A (used by Node B daemon, and by clients)
   "node-A":
     endpoint: "node-a.example.com:59240" # Or IP:port "192.168.42.2:59240"
-    signing_public_key: "nodeA_signing_public.json" # For verifying requests FROM Node A
-    hybrid_public_key: "nodeA_hybrid_public.json"   # For encrypting fragments FOR Node A (used by 'push' and GetDecoded)
+    public_key_path: "nodeA_public.json" # Path to Node A's combined public keyset
     # poll_interval: "60s" # Optional: Poll Node A every 60 seconds
 
   # Configuration for Node B (used by Node A daemon, and by clients)
   "node-B":
     endpoint: "node-b.example.com:59240" # Or IP:port "192.168.42.34:59240"
-    signing_public_key: "nodeB_signing_public.json" # For verifying requests FROM Node B
-    hybrid_public_key: "nodeB_hybrid_public.json"   # For encrypting fragments FOR Node B (used by 'push' and GetDecoded)
+    public_key_path: "nodeB_public.json" # Path to Node B's combined public keyset
     poll_interval: "60s" # Poll Node B every 60 seconds
 
   # Configuration for the Client (used by Node A & B daemons for auth verification and GetDecoded encryption)
-  # The client itself doesn't run a daemon, but nodes need its public keys.
+  # The client itself doesn't run a daemon, but nodes need its public keyset info.
   "client-X":
     endpoint: "" # Endpoint not needed as client doesn't listen
-    signing_public_key: "clientX_signing_public.json" # For verifying requests FROM the client
-    hybrid_public_key: "clientX_hybrid_public.json"   # For encrypting GetDecoded responses FOR the client
+    public_key_path: "clientX_public.json" # Path to Client X's combined public keyset
     # poll_interval not applicable
 ```
 
@@ -203,112 +174,85 @@ Ensure the `sssmemvault` binary is built (`make sssmemvault`).
 
 **On Node A:**
 *   Copy `config.yaml`.
-*   Ensure `nodeA_signing_private.json`, `nodeA_hybrid_private.json`, `master_signing_public.json`, `nodeB_signing_public.json`, `nodeB_hybrid_public.json`, `clientX_signing_public.json`, `clientX_hybrid_public.json` are accessible.
-*   Crucially, rename/copy `nodeA_signing_private.json` and `nodeA_hybrid_private.json` to match the paths in `config.yaml` (e.g., `node_signing_private.json`, `node_hybrid_private.json`).
+*   Ensure `nodeA_private.json`, `master_public.json`, `nodeB_public.json`, `clientX_public.json` are accessible.
+*   Crucially, rename/copy `nodeA_private.json` to match the `private_key_path` in `config.yaml` (e.g., `node_private.json`).
 
 ```bash
-# Assuming config.yaml uses "node_signing_private.json" and "node_hybrid_private.json"
-cp nodeA_signing_private.json node_signing_private.json
-cp nodeA_hybrid_private.json node_hybrid_private.json
+# Assuming config.yaml uses "node_private.json"
+cp nodeA_private.json node_private.json
 
 ./sssmemvault daemon --config config.yaml --my-name node-A --loglevel debug
 ```
 
 **On Node B:**
 *   Copy `config.yaml`.
-*   Ensure `nodeB_signing_private.json`, `nodeB_hybrid_private.json`, `master_signing_public.json`, `nodeA_signing_public.json`, `nodeA_hybrid_public.json`, `clientX_signing_public.json`, `clientX_hybrid_public.json` are accessible.
-*   Rename/copy `nodeB_signing_private.json` and `nodeB_hybrid_private.json` to match the paths in `config.yaml`.
+*   Ensure `nodeB_private.json`, `master_public.json`, `nodeA_public.json`, `clientX_public.json` are accessible.
+*   Rename/copy `nodeB_private.json` to match the `private_key_path` in `config.yaml`.
 
 ```bash
-# Assuming config.yaml uses "node_signing_private.json" and "node_hybrid_private.json"
-cp nodeB_signing_private.json node_signing_private.json
-cp nodeB_hybrid_private.json node_hybrid_private.json
+# Assuming config.yaml uses "node_private.json"
+cp nodeB_private.json node_private.json
 
 ./sssmemvault daemon --config config.yaml --my-name node-B --loglevel debug
 ```
 
-The nodes will now start, load their respective signing and hybrid private keys, connect to peers defined in the config (using peer names), listen for requests, and poll peers with `poll_interval`.
+The nodes will now start, load their respective combined private keysets, connect to peers defined in the config, listen for requests, and poll peers with `poll_interval`.
 
 **7. Provisioning a Secret (`sssmemvault push`)**
 
-Use the `sssmemvault push` subcommand. This requires the *master signing private key* and the *hybrid public keys* of the owner nodes. Run this from any machine that has access to these keys.
+Use the `sssmemvault push` subcommand. This requires the *master signing private key* and a `--config` file. Owners are derived from the peers listed in the config file. Run this from any machine that has access to the master private key and the config file.
 
 ```bash
 # Example: Push a secret named "api-key" with value "supersecret123"
-# Owned by Node A and Node B.
-# Split into 4 fragments, requiring 3 to reconstruct (threshold 3).
-# Assign 2 fragments to Node A and 2 fragments to Node B.
+# Owned by Node A and Node B (derived from config).
+# Split into 2 fragments (must match number of owners in config), requiring 2 to reconstruct.
 # Readable by Node A, Node B, and the client client-X.
-# Push the entry to both Node A and Node B using explicit flags:
+# Targets are derived from config unless specified with --target.
 
 ./sssmemvault push \
-  --master-signing-key master_signing_private.json \
-  --owner node-A=nodeA_hybrid_public.json:2 \
-  --owner node-B=nodeB_hybrid_public.json:2 \
+  --master-private-key master_private.json \
+  --config config.yaml \
   --reader node-A \
   --reader node-B \
   --reader client-X \
   --key "api-key" \
   --secret "supersecret123" \
-  --parts 4 \
-  --threshold 3 \
-  --target node-a.example.com:59240 \
-  --target node-b.example.com:59240 \
-  --loglevel info
-
-# Alternatively, push using a config file to source owners and targets:
-# (Ensure config.yaml contains the necessary peer info for node-A and node-B,
-# specifically their hybrid_public_key)
-
-./sssmemvault push \
-  --master-signing-key master_signing_private.json \
-  --config config.yaml \
-  # Note: When using --config, owners are derived from the 'peers' section.
-  # The count defaults to 1 per owner unless explicit --owner flags are also provided
-  # to override specific counts or if the derived owners are not sufficient.
-  # Example below assumes owners ARE derived from config, but we still need readers:
-  --reader node-A \
-  --reader node-B \
-  --reader client-X \
-  --key "another-api-key" \
-  --secret "differentSecret987" \
-  --parts 2 \ # Must match number of owners derived from config (node-A, node-B)
+  --parts 2 \
   --threshold 2 \
   --loglevel info
 ```
 
 This command will:
 1. Load the master signing private key.
-2. Parse owner info (`Name=Path:Count`) or derive owners from `--config`. Load hybrid public keys.
-3. Validate that the total fragment count (from `--owner` flags or derived count) equals `--parts`.
-4. Split the secret into fragments based on `--parts` and `--threshold`.
-5. Encrypt fragments and assign them according to specified counts (or round-robin if derived).
-6. Create the protobuf `Entry`, storing the encrypted fragments in lists associated with each owner **name** (`OwnerFragments` map). Include reader **names**.
-7. Sign the entry using the master signing private key.
-8. Connect to the target nodes and call the `Push` RPC.
+2. Load the config file.
+3. Identify owner peers (nodes with public keys listed in `peers`).
+4. Validate that `--parts` matches the number of identified owner peers.
+5. Split the secret into fragments based on `--parts` and `--threshold`.
+6. Encrypt each fragment using the corresponding owner's *hybrid public key* (extracted from their `public_key_path` in the config).
+7. Create the protobuf `Entry`, storing the encrypted fragments associated with each owner **name**. Include reader **names**.
+8. Sign the entry using the master signing private key.
+9. Connect to the target nodes (derived from config or specified via `--target`) and call the `Push` RPC.
 
-Nodes receiving the `Push` will verify the master signature (using `master_signing_public.json` from their config) and store the entry. The synchronizer will eventually propagate the entry between nodes if it wasn't pushed to all initially.
+Nodes receiving the `Push` will verify the master signature (using `master_public_key_path` from their config) and store the entry.
 
 **8. Retrieving a Secret (`sssmemvault get`)**
 
-Use the `sssmemvault get` subcommand from an authorized reader machine (e.g., `client-X`). This requires the *client's name* (`--client-name`), its *signing private key* (`--signing-private-key`) for authentication, its *hybrid private key* (`--hybrid-private-key`) for decryption, and optionally a `config.yaml` file to find owner node endpoints.
+Use the `sssmemvault get` subcommand from an authorized reader machine (e.g., `client-X`). This requires the *client's name* (`--client-name`), its combined *private keyset* (`--private-key`), and a `--config` file.
 
 **On the Client machine (client-X):**
-*   Ensure `sssmemvault` binary, `clientX_signing_private.json`, `clientX_hybrid_private.json`, and `config.yaml` are present.
-*   The `config.yaml` needs `peers` entries for at least the *owner* nodes (`node-A`, `node-B`) so the `get` command knows their endpoints.
+*   Ensure `sssmemvault` binary, `clientX_private.json`, and `config.yaml` are present.
+*   The `config.yaml` needs `peers` entries for at least the *owner* nodes (`node-A`, `node-B`) so the `get` command knows their endpoints and the nodes know the client's public key.
 
 ```bash
 # Example: Retrieve the "api-key" secret
 
-# Using config file to find owner endpoints and specifying targets to query initially
 ./sssmemvault get \
   --client-name client-X \
-  --signing-private-key clientX_signing_private.json \
-  --hybrid-private-key clientX_hybrid_private.json \
+  --private-key clientX_private.json \
   --config config.yaml \
   --key "api-key" \
-  --target node-a.example.com:59240 \
-  --target node-b.example.com:59240 \
+  # --target node-a.example.com:59240 # Optional: Specify targets explicitly
+  # --target node-b.example.com:59240
   --output api-key.txt \
   --loglevel info
 
@@ -317,20 +261,20 @@ cat api-key.txt
 ```
 
 This command will:
-1. Load the client signing private key (`clientX_signing_private.json`).
-2. Load the client hybrid private key (`clientX_hybrid_private.json`).
-3. Load the config file (`config.yaml`) to find peer endpoints.
-4. Connect to the specified target nodes (`--target`) and call `List` (authenticating with `--client-name` and `--signing-private-key`) to find the latest timestamp for `"api-key"`.
-5. Call `Get` on the node with the latest timestamp (authenticating again) to retrieve the full entry.
-6. Identify the owner **names** from the entry (`node-A`, `node-B`).
-7. Look up the endpoints for these owners by **name** in the loaded `config.yaml`.
-8. Connect to *each* owner node endpoint.
-9. Call `GetDecoded` on each owner node (authenticating with `--client-name` and `--signing-private-key`). Each owner node will:
+1. Load the client's combined private keyset (`clientX_private.json`), extracting the signer and decrypter.
+2. Load the config file (`config.yaml`) to find peer endpoints and public keys.
+3. Connect to the target nodes (derived from config or `--target`) and call `List` (authenticating with client name and signing key) to find the latest timestamp for `"api-key"`.
+4. Call `Get` on the node with the latest timestamp (authenticating again) to retrieve the full entry.
+5. Identify the owner **names** from the entry (`node-A`, `node-B`).
+6. Look up the endpoints for these owners by **name** in the loaded `config.yaml`.
+7. Connect to *each* owner node endpoint.
+8. Call `GetDecoded` on each owner node (authenticating with client name and signing key). Each owner node will:
     a. Verify the client (`client-X`) is in the entry's `readers` list.
-    b. Decrypt its fragment(s) using its own *hybrid private key*.
-    c. Find the client's *hybrid public key* (`clientX_hybrid_public.json`) using the client's name (`client-X`) in its `peers` config.
-    d. Re-encrypt the fragment(s) using the client's *hybrid public key*.
-    e. Return the re-encrypted fragment(s).
-10. Decrypt each received fragment using the client's *hybrid private key* (`--hybrid-private-key`).
-11. Combine the decrypted fragments using Shamir's algorithm (needs enough fragments to meet the threshold).
-12. Write the reconstructed secret to `api-key.txt`.
+    b. Decrypt its fragment(s) using its own *hybrid private key* (from its `private_key_path`).
+    c. Find the client's *public keyset* (`clientX_public.json`) using the client's name (`client-X`) in its `peers` config.
+    d. Extract the client's *hybrid public key* from the keyset.
+    e. Re-encrypt the fragment(s) using the client's *hybrid public key*.
+    f. Return the re-encrypted fragment(s).
+9. Decrypt each received fragment using the client's *hybrid private key* (extracted from `--private-key`).
+10. Combine the decrypted fragments using Shamir's algorithm (needs enough fragments to meet the threshold).
+11. Write the reconstructed secret to `api-key.txt`.

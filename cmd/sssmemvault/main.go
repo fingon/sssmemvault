@@ -7,6 +7,7 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/fingon/sssmemvault/internal/cliutil"
 	"github.com/fingon/sssmemvault/internal/daemon"
+	"github.com/fingon/sssmemvault/internal/genkeys"
 	"github.com/fingon/sssmemvault/internal/get"
 	"github.com/fingon/sssmemvault/internal/push"
 	// --- Register Tink Primitives ---
@@ -26,9 +27,10 @@ import (
 var cli struct {
 	LogLevel string `kong:"name='loglevel',enum='debug,info,warn,error',default='info',help='Log level (debug, info, warn, error).',env='SSSMEMVAULT_LOGLEVEL'"`
 
-	Daemon daemon.Config `kong:"cmd,help='Run the sssmemvault daemon node.'"`
-	Push   push.Config   `kong:"cmd,help='Push a new secret entry to target nodes.'"`
-	Get    get.Config    `kong:"cmd,help='Retrieve and reconstruct a secret from owner nodes.'"`
+	Daemon  daemon.Config  `kong:"cmd,help='Run the sssmemvault daemon node.'"`
+	Push    push.Config    `kong:"cmd,help='Push a new secret entry to target nodes.'"`
+	Get     get.Config     `kong:"cmd,help='Retrieve and reconstruct a secret from owner nodes.'"`
+	GenKeys genkeys.Config `kong:"cmd,help='Generate combined private and public keyset files.'"`
 }
 
 func main() {
@@ -62,6 +64,8 @@ func main() {
 		exitCode = push.Run(&cli.Push)
 	case "get":
 		exitCode = get.Run(&cli.Get)
+	case "gen-keys", "genkeys": // Allow alias
+		exitCode = genkeys.Run(&cli.GenKeys)
 	default:
 		// Should be caught by Kong, but handle defensively.
 		slog.Error("Unknown command", "command", kctx.Command())

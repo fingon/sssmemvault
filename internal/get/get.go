@@ -20,26 +20,25 @@ import (
 
 // Config holds the specific configuration needed for the get subcommand.
 type Config struct {
-	ClientName            string   `kong:"name='client-name',required,help='The name of this client (must match a key in target node configs).'"`
-	SigningPrivateKeyPath string   `kong:"name='signing-private-key',required,help='Path to the client private key JSON file (for signing requests).'"`
-	HybridPrivateKeyPath  string   `kong:"name='hybrid-private-key',required,help='Path to the client private key JSON file (for decrypting received fragments).'"`
-	Key                   string   `kong:"name='key',required,help='The key name for the secret to retrieve.'"`
-	OutputFile            string   `kong:"name='output',short='o',help='Path to write the reconstructed secret to (stdout if not specified).'"`
-	Targets               []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to query. Repeat for each target. Can be sourced from --config.'"`
-	ConfigPath            string   `kong:"name='config',optional,help='Path to a configuration file to load parameters from (targets, peer info).'"`
+	ClientName     string   `kong:"name='client-name',required,help='The name of this client (must match a key in target node configs).'"`
+	PrivateKeyPath string   `kong:"name='private-key',required,help='Path to the client combined private keyset JSON file (signing + hybrid).'"`
+	Key            string   `kong:"name='key',required,help='The key name for the secret to retrieve.'"`
+	OutputFile     string   `kong:"name='output',short='o',help='Path to write the reconstructed secret to (stdout if not specified).'"`
+	Targets        []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to query. Repeat for each target. Can be sourced from --config.'"`
+	ConfigPath     string   `kong:"name='config',required,help='Path to a configuration file to load parameters from (targets, peer info).'"` // Made required
 	// LogLevel is handled globally
 }
 
-// loadConfigAndDeriveParams loads the configuration file if specified and updates
-// the get Config struct with targets derived from the config if they weren't
-// provided via command-line flags. It returns the loaded app config or nil.
-func loadConfigAndDeriveParams(getCfg *Config) (*config.Config, error) {
+// loadConfigAndDeriveTargets loads the configuration file and derives targets if needed.
+// It returns the loaded app config.
+func loadConfigAndDeriveTargets(getCfg *Config) (*config.Config, error) {
 	if getCfg.ConfigPath == "" {
-		return nil, nil // No config file specified, nothing to do
+		// Config path is now required by kong
+		return nil, errors.New("configuration file path is required")
 	}
 
 	slog.Info("Loading configuration file", "path", getCfg.ConfigPath)
-	// Load config but ignore private key errors as we use a specific client key
+	// Load config, ignoring own private key errors as 'get' uses the specific client key path.
 	appCfg, err := config.LoadConfigIgnoreOwnKey(getCfg.ConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load configuration file %q: %w", getCfg.ConfigPath, err)
@@ -49,50 +48,68 @@ func loadConfigAndDeriveParams(getCfg *Config) (*config.Config, error) {
 	// Populate targets from config if not provided via flags
 	if len(getCfg.Targets) == 0 {
 		slog.Debug("Populating targets from config file")
-		if appCfg.Peers == nil || len(appCfg.Peers) == 0 {
+		if appCfg.LoadedPeers == nil || len(appCfg.LoadedPeers) == 0 {
 			return nil, errors.New("config file specified but contains no peers to use as targets")
 		}
 		// Endpoints are validated during config.LoadConfig, so we assume they exist here.
-		for _, peerCfg := range appCfg.Peers {
-			getCfg.Targets = append(getCfg.Targets, peerCfg.Endpoint)
+		for name, peerCfg := range appCfg.LoadedPeers {
+			if peerCfg.Endpoint != "" { // Only add peers with endpoints as targets
+				getCfg.Targets = append(getCfg.Targets, peerCfg.Endpoint)
+			} else {
+				slog.Debug("Skipping peer as target (no endpoint defined)", "peer_name", name)
+			}
 		}
 		slog.Info("Using targets derived from config file", "count", len(getCfg.Targets))
 	}
 	return appCfg, nil
 }
 
-// loadClientKeys loads the signing and hybrid private keys for the client.
-func loadClientKeys(signingKeyPath, hybridKeyPath string) (tink.Signer, tink.HybridDecrypt, error) {
-	slog.Debug("Loading client signing private key", "path", signingKeyPath)
-	clientSigner, err := crypto.LoadPrivateKeySigner(signingKeyPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load client signing private key %q: %w", signingKeyPath, err)
-	}
-	slog.Info("Loaded client signing private key successfully")
+// loadClientKeys loads the signing and hybrid decryption primitives from the client's combined private keyset file.
+func loadClientKeys(privateKeyPath string) (tink.Signer, tink.HybridDecrypt, error) {
+	slog.Debug("Loading client private keyset", "path", privateKeyPath)
 
-	slog.Debug("Loading client hybrid private key", "path", hybridKeyPath)
-	clientDecrypter, err := crypto.LoadClientHybridPrivateKey(hybridKeyPath)
+	// Load Signer
+	clientSigner, err := crypto.LoadSigner(privateKeyPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load client hybrid private key %q: %w", hybridKeyPath, err)
+		return nil, nil, fmt.Errorf("failed to load client signer from keyset %q: %w", privateKeyPath, err)
 	}
-	slog.Info("Loaded client hybrid private key successfully")
+	slog.Info("Loaded client signer successfully")
+
+	// Load Decrypter
+	clientDecrypter, err := crypto.LoadDecrypter(privateKeyPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load client decrypter from keyset %q: %w", privateKeyPath, err)
+	}
+	slog.Info("Loaded client decrypter successfully")
 
 	return clientSigner, clientDecrypter, nil
 }
 
 // determineOwnerEndpoints finds the gRPC endpoints for the given owner names using the loaded config.
-func determineOwnerEndpoints(appCfg *config.Config, ownerNames []string, configPath string) (map[string]string, error) {
+func determineOwnerEndpoints(appCfg *config.Config, ownerNames []string) (map[string]string, error) {
 	if appCfg == nil {
-		return nil, errors.New("cannot determine owner endpoints without a configuration file (--config)")
+		// Should not happen as config is now required
+		return nil, errors.New("internal error: configuration not loaded")
 	}
 	ownerEndpoints := make(map[string]string) // Map: Owner Name -> Endpoint
+	missingEndpoints := []string{}
 	for _, ownerName := range ownerNames {
-		peerCfg, ok := appCfg.LoadedPeers[ownerName] // Use LoadedPeers which has pointers
-		if !ok || peerCfg == nil || peerCfg.Endpoint == "" {
-			return nil, fmt.Errorf("could not find endpoint for owner %q in configuration file %q", ownerName, configPath)
+		peerCfg, ok := appCfg.LoadedPeers[ownerName]
+		if !ok || peerCfg == nil {
+			slog.Warn("Could not find config entry for owner", "owner_name", ownerName)
+			missingEndpoints = append(missingEndpoints, ownerName+" (not found in config)")
+			continue
+		}
+		if peerCfg.Endpoint == "" {
+			slog.Warn("Owner found in config but has no endpoint defined", "owner_name", ownerName)
+			missingEndpoints = append(missingEndpoints, ownerName+" (no endpoint)")
+			continue
 		}
 		ownerEndpoints[ownerName] = peerCfg.Endpoint
 		slog.Debug("Found endpoint for owner", "owner_name", ownerName, "endpoint", peerCfg.Endpoint)
+	}
+	if len(missingEndpoints) > 0 {
+		return nil, fmt.Errorf("could not find endpoints for all owners in configuration file %q: %v", appCfg.PrivateKeyPath, missingEndpoints) // Use a config path field if available, or just the list
 	}
 	return ownerEndpoints, nil
 }
@@ -210,8 +227,8 @@ func combineAndOutput(decryptedFragments [][]byte, threshold int32, outputPath s
 func Run(getCfg *Config) int {
 	slog.Info("Starting get operation...")
 
-	// --- Load Config if specified and derive parameters ---
-	appCfg, err := loadConfigAndDeriveParams(getCfg) // appCfg might be nil
+	// --- Load Config and derive targets ---
+	appCfg, err := loadConfigAndDeriveTargets(getCfg) // appCfg is guaranteed non-nil if err is nil
 	if err != nil {
 		slog.Error("Failed to load or process configuration", "err", err)
 		return 1
@@ -219,17 +236,17 @@ func Run(getCfg *Config) int {
 
 	// --- Validate Inputs ---
 	if len(getCfg.Targets) == 0 {
-		slog.Error("No targets specified. Provide via --target flags or --config file.")
+		slog.Error("No targets specified. Provide via --target flags or derive from --config file.")
 		return 1
 	}
-	// Other input validations... (key, clientName, key paths)
-	if getCfg.Key == "" || getCfg.ClientName == "" || getCfg.SigningPrivateKeyPath == "" || getCfg.HybridPrivateKeyPath == "" {
-		slog.Error("Missing required arguments: key, client-name, signing-private-key, or hybrid-private-key")
+	// Other input validations... (key, clientName, key path)
+	if getCfg.Key == "" || getCfg.ClientName == "" || getCfg.PrivateKeyPath == "" {
+		slog.Error("Missing required arguments: key, client-name, or private-key")
 		return 1
 	}
 
 	// --- Load Client Keys ---
-	clientSigner, clientDecrypter, err := loadClientKeys(getCfg.SigningPrivateKeyPath, getCfg.HybridPrivateKeyPath)
+	clientSigner, clientDecrypter, err := loadClientKeys(getCfg.PrivateKeyPath)
 	if err != nil {
 		slog.Error("Failed to load client keys", "err", err)
 		return 1
@@ -257,11 +274,11 @@ func Run(getCfg *Config) int {
 	for name := range latestEntry.OwnerFragments {
 		ownerNames = append(ownerNames, name)
 	}
-	sort.Strings(ownerNames)
+	sort.Strings(ownerNames) // Sort for consistent logging
 	slog.Info("Identified owners for the entry", "key", getCfg.Key, "owners", ownerNames)
 
 	// --- Determine Owner Endpoints ---
-	ownerEndpoints, err := determineOwnerEndpoints(appCfg, ownerNames, getCfg.ConfigPath)
+	ownerEndpoints, err := determineOwnerEndpoints(appCfg, ownerNames)
 	if err != nil {
 		slog.Error("Failed to determine owner endpoints", "err", err)
 		return 1

@@ -3,10 +3,10 @@ package main_test
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -18,7 +18,6 @@ import (
 	_ "github.com/tink-crypto/tink-go/v2/hybrid"
 	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset"
 	"github.com/tink-crypto/tink-go/v2/keyset"
-	tinkpb "github.com/tink-crypto/tink-go/v2/proto/tink_go_proto" // Updated proto path
 	"github.com/tink-crypto/tink-go/v2/signature"
 	_ "github.com/tink-crypto/tink-go/v2/signature"
 	"google.golang.org/grpc"
@@ -37,7 +36,7 @@ const (
 	nodeIP        = "127.0.0.1"
 	node1Port     = "59251" // Use distinct ports
 	node2Port     = "59252"
-	pollInterval  = "5s" // Faster polling for test
+	pollInterval  = 2 * time.Second // Faster polling for test
 )
 
 var (
@@ -45,37 +44,52 @@ var (
 	node2Endpoint = net.JoinHostPort(nodeIP, node2Port)
 )
 
-// peerKeyPaths holds the public key paths needed for peer configuration.
-type peerKeyPaths struct {
-	SigningPublic string
-	HybridPublic  string
+// peerInfo holds paths needed for peer configuration.
+type peerInfo struct {
+	PublicKeyPath string // Combined public keyset (signing + hybrid)
 }
 
-// generateTinkKeyset generates a Tink keyset for a *single* key template.
-func generateSingleTinkKeyset(t *testing.T, dir, name string, keyTemplate *tinkpb.KeyTemplate) (privPath, pubPath string) {
+// generateCombinedKeyset generates combined private and public keyset files.
+// This simulates the `genkeys` command for testing purposes.
+func generateCombinedKeyset(t *testing.T, dir, name string) (privPath, pubPath string) {
 	t.Helper()
 
 	privPath = filepath.Join(dir, name+"_private.json")
 	pubPath = filepath.Join(dir, name+"_public.json")
 
-	// Create a new keyset handle with the specified template
-	handle, err := keyset.NewHandle(keyTemplate)
-	assert.NilError(t, err, "Failed to create new keyset handle for %s", name)
+	// Use KeysetManager to build the combined keyset
+	manager := keyset.NewManager()
+
+	// Add signing key
+	signingTemplate := signature.ECDSAP256KeyTemplate()
+	signingKeyID, err := manager.Add(signingTemplate) // Add returns keyID, err
+	assert.NilError(t, err, "Failed to add signing key template to manager for %s", name)
+	err = manager.SetPrimary(signingKeyID) // Set signing key as primary
+	assert.NilError(t, err, "Failed to set signing key as primary for %s", name)
+
+	// Add hybrid key
+	hybridTemplate := hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template()
+	_, err = manager.Add(hybridTemplate) // Add returns keyID, err - we don't need the ID here
+	assert.NilError(t, err, "Failed to add hybrid key template to manager for %s", name)
+
+	// Get the final combined handle (signing key remains primary)
+	privateHandle, err := manager.Handle()
+	assert.NilError(t, err, "Failed to get final combined handle for %s", name)
 
 	// Write private keyset
 	privBuf := new(bytes.Buffer)
-	writer := keyset.NewJSONWriter(privBuf)
-	err = insecurecleartextkeyset.Write(handle, writer)
+	privWriter := keyset.NewJSONWriter(privBuf)
+	err = insecurecleartextkeyset.Write(privateHandle, privWriter)
 	assert.NilError(t, err, "Failed to write private keyset for %s", name)
 	err = os.WriteFile(privPath, privBuf.Bytes(), 0o600)
 	assert.NilError(t, err, "Failed to save private keyset file for %s", name)
 
 	// Get and write public keyset
-	pubHandle, err := handle.Public()
+	publicHandle, err := privateHandle.Public()
 	assert.NilError(t, err, "Failed to get public keyset handle for %s", name)
 	pubBuf := new(bytes.Buffer)
 	pubWriter := keyset.NewJSONWriter(pubBuf)
-	err = insecurecleartextkeyset.Write(pubHandle, pubWriter)
+	err = insecurecleartextkeyset.Write(publicHandle, pubWriter)
 	assert.NilError(t, err, "Failed to write public keyset for %s", name)
 	err = os.WriteFile(pubPath, pubBuf.Bytes(), 0o600)
 	assert.NilError(t, err, "Failed to save public keyset file for %s", name)
@@ -83,15 +97,45 @@ func generateSingleTinkKeyset(t *testing.T, dir, name string, keyTemplate *tinkp
 	return privPath, pubPath
 }
 
+// generateMasterKeys generates the master signing key pair (signing only).
+func generateMasterKeys(t *testing.T, dir string) (privPath, pubPath string) {
+	t.Helper()
+	privPath = filepath.Join(dir, "master_private.json")
+	pubPath = filepath.Join(dir, "master_public.json")
+
+	handle, err := keyset.NewHandle(signature.ED25519KeyTemplate())
+	assert.NilError(t, err, "Failed to create master keyset handle")
+
+	// Write private
+	privBuf := new(bytes.Buffer)
+	writer := keyset.NewJSONWriter(privBuf)
+	err = insecurecleartextkeyset.Write(handle, writer)
+	assert.NilError(t, err, "Failed to write master private keyset")
+	err = os.WriteFile(privPath, privBuf.Bytes(), 0o600)
+	assert.NilError(t, err, "Failed to save master private keyset file")
+
+	// Write public
+	pubHandle, err := handle.Public()
+	assert.NilError(t, err, "Failed to get master public keyset handle")
+	pubBuf := new(bytes.Buffer)
+	pubWriter := keyset.NewJSONWriter(pubBuf)
+	err = insecurecleartextkeyset.Write(pubHandle, pubWriter)
+	assert.NilError(t, err, "Failed to write master public keyset")
+	err = os.WriteFile(pubPath, pubBuf.Bytes(), 0o600)
+	assert.NilError(t, err, "Failed to save master public keyset file")
+
+	return privPath, pubPath
+}
+
 // createNodeConfig creates a YAML config file for a daemon node.
-func createNodeConfig(t *testing.T, dir, name, myPort, mySigningPrivKeyPath, myHybridPrivKeyPath, masterSigningPubKeyPath string, peers map[string]peerKeyPaths) string {
+func createNodeConfig(t *testing.T, dir, name, myPort, myPrivateKeyPath, masterPubKeyPath string, peers map[string]peerInfo) string {
 	t.Helper()
 	cfgPath := filepath.Join(dir, name+"_config.yaml")
 	listenAddr := net.JoinHostPort("", myPort) // Listen on all interfaces for the given port
 
 	peerConfigs := make(map[string]config.PeerConfig) // Map key is now peer name
-	pollDuration := time.Second * 5                   // Convert string to duration for config struct
-	for peerName, keys := range peers {
+	pollDuration := pollInterval                      // Use defined duration
+	for peerName, peerData := range peers {
 		// Determine endpoint based on Name - assumes test setup uses specific ports/endpoints
 		var endpoint string
 		switch peerName {
@@ -100,36 +144,36 @@ func createNodeConfig(t *testing.T, dir, name, myPort, mySigningPrivKeyPath, myH
 		case node2Name:
 			endpoint = node2Endpoint
 		case clientName:
-			endpoint = "" // Client doesn't listen
+			endpoint = "" // Client doesn't listen, no endpoint needed in peer config for it
 		default:
 			t.Fatalf("Unknown peer name in test setup: %s", peerName)
 		}
 
 		// Add all peers (nodes and client) to the config
 		peerCfg := config.PeerConfig{
-			SigningPublicKey: keys.SigningPublic, // Use absolute path
-			HybridPublicKey:  keys.HybridPublic,  // Use absolute path
+			PublicKeyPath: peerData.PublicKeyPath, // Use absolute path
+			Endpoint:      endpoint,               // Set endpoint (can be empty for client)
 		}
 
-		// Set endpoint and poll interval only for actual peer nodes, not the client
-		if endpoint != "" && peerName != clientName { // Check it's not the client
-			peerCfg.Endpoint = endpoint
-			peerCfg.PollInterval = &pollDuration
+		// Set poll interval only for actual peer nodes, not the client or self
+		// Note: The current node's own entry in `peers` is usually ignored by the synchronizer,
+		// but setting PollInterval doesn't hurt. Client entry should not have it.
+		if endpoint != "" && peerName != clientName {
+			// Make a copy of the duration for the pointer
+			interval := pollDuration
+			peerCfg.PollInterval = &interval
 		} else {
-			// Client entry or self-entry might not have endpoint/poll interval
-			peerCfg.Endpoint = endpoint // Can be empty for client
 			peerCfg.PollInterval = nil
 		}
 		peerConfigs[peerName] = peerCfg
 	}
 
 	nodeCfg := config.Config{
-		SigningPrivateKeyPath:  mySigningPrivKeyPath,    // Use absolute path
-		HybridPrivateKeyPath:   myHybridPrivKeyPath,     // Use absolute path
-		MasterSigningPublicKey: masterSigningPubKeyPath, // Use absolute path
-		ListenAddress:          listenAddr,
-		MaxTimestampSkew:       30 * time.Second,
-		Peers:                  peerConfigs,
+		PrivateKeyPath:      myPrivateKeyPath, // Use absolute path
+		MasterPublicKeyPath: masterPubKeyPath, // Use absolute path
+		ListenAddress:       listenAddr,
+		MaxTimestampSkew:    30 * time.Second,
+		Peers:               peerConfigs,
 	}
 
 	yamlData, err := yaml.Marshal(nodeCfg)
@@ -184,64 +228,59 @@ func waitForDaemon(t *testing.T, endpoint string, timeout time.Duration) {
 	}
 }
 
-// --- Test Helper Functions ---
+// --- Test Setup Helpers ---
 
-// testKeyPaths holds paths to generated keys for a single entity (node/client/master).
-type testKeyPaths struct {
-	SigningPrivate string
-	SigningPublic  string
-	HybridPrivate  string
-	HybridPublic   string
+// testKeys holds paths to generated keys for a single entity (node/client/master).
+type testKeys struct {
+	PrivatePath string
+	PublicPath  string
 }
 
-// generateTestKeys generates all necessary keys for the integration test.
-func generateTestKeys(t *testing.T, dir string) (masterKeys, node1Keys, node2Keys, clientKeys testKeyPaths) {
+// generateAllTestKeys generates all necessary keys for the integration test.
+func generateAllTestKeys(t *testing.T, dir string) (masterKeys, node1Keys, node2Keys, clientKeys testKeys) {
 	t.Helper()
-	// Master key (signing only)
-	masterKeys.SigningPrivate, masterKeys.SigningPublic = generateSingleTinkKeyset(t, dir, "master_signing", signature.ED25519KeyTemplate())
+	// Master key (signing only) - still generate separate for clarity, though config uses combined format
+	masterKeys.PrivatePath, masterKeys.PublicPath = generateMasterKeys(t, dir) // Use specific master key gen
 
-	// Node 1 keys
-	node1Keys.SigningPrivate, node1Keys.SigningPublic = generateSingleTinkKeyset(t, dir, node1Name+"_signing", signature.ECDSAP256KeyTemplate())
-	node1Keys.HybridPrivate, node1Keys.HybridPublic = generateSingleTinkKeyset(t, dir, node1Name+"_hybrid", hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template())
+	// Node 1 keys (combined)
+	node1Keys.PrivatePath, node1Keys.PublicPath = generateCombinedKeyset(t, dir, node1Name)
 
-	// Node 2 keys
-	node2Keys.SigningPrivate, node2Keys.SigningPublic = generateSingleTinkKeyset(t, dir, node2Name+"_signing", signature.ECDSAP256KeyTemplate())
-	node2Keys.HybridPrivate, node2Keys.HybridPublic = generateSingleTinkKeyset(t, dir, node2Name+"_hybrid", hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template())
+	// Node 2 keys (combined)
+	node2Keys.PrivatePath, node2Keys.PublicPath = generateCombinedKeyset(t, dir, node2Name)
 
-	// Client keys
-	clientKeys.SigningPrivate, clientKeys.SigningPublic = generateSingleTinkKeyset(t, dir, clientName+"_signing", signature.ECDSAP256KeyTemplate())
-	clientKeys.HybridPrivate, clientKeys.HybridPublic = generateSingleTinkKeyset(t, dir, clientName+"_hybrid", hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template())
+	// Client keys (combined)
+	clientKeys.PrivatePath, clientKeys.PublicPath = generateCombinedKeyset(t, dir, clientName)
 
 	return masterKeys, node1Keys, node2Keys, clientKeys
 }
 
-// createTestConfigs creates the necessary config files for nodes and the client.
-func createTestConfigs(t *testing.T, dir string, masterKeys, node1Keys, node2Keys, clientKeys testKeyPaths) (node1CfgPath, node2CfgPath, clientCfgPath string) {
+// createTestConfigs creates the necessary config files for nodes.
+// Client config is no longer strictly needed by the client itself if targets are specified,
+// but nodes still need the client's public key info in their peer list.
+func createTestConfigs(t *testing.T, dir string, masterKeys, node1Keys, node2Keys, clientKeys testKeys) (node1CfgPath, node2CfgPath string) {
 	t.Helper()
-	// Define peer public key info needed by each node/client config
-	node1PeerKeys := peerKeyPaths{SigningPublic: node1Keys.SigningPublic, HybridPublic: node1Keys.HybridPublic}
-	node2PeerKeys := peerKeyPaths{SigningPublic: node2Keys.SigningPublic, HybridPublic: node2Keys.HybridPublic}
-	clientPeerKeys := peerKeyPaths{SigningPublic: clientKeys.SigningPublic, HybridPublic: clientKeys.HybridPublic}
+	// Define peer public key info needed by each node config
+	node1PeerInfo := peerInfo{PublicKeyPath: node1Keys.PublicPath}
+	node2PeerInfo := peerInfo{PublicKeyPath: node2Keys.PublicPath}
+	clientPeerInfo := peerInfo{PublicKeyPath: clientKeys.PublicPath}
 
 	// Define all known peers for config generation (using names as keys)
-	allPeers := map[string]peerKeyPaths{
-		node1Name:  node1PeerKeys,
-		node2Name:  node2PeerKeys,
-		clientName: clientPeerKeys,
+	allPeers := map[string]peerInfo{
+		node1Name:  node1PeerInfo,
+		node2Name:  node2PeerInfo,
+		clientName: clientPeerInfo, // Nodes need client info for auth/encryption
 	}
 
-	// Peers needed for Client's config (only needs actual nodes for endpoint lookup)
-	peersForClientConfig := map[string]peerKeyPaths{
-		node1Name: node1PeerKeys,
-		node2Name: node2PeerKeys,
-	}
+	// Create config files for nodes
+	node1CfgPath = createNodeConfig(t, dir, node1Name, node1Port, node1Keys.PrivatePath, masterKeys.PublicPath, allPeers)
+	node2CfgPath = createNodeConfig(t, dir, node2Name, node2Port, node2Keys.PrivatePath, masterKeys.PublicPath, allPeers)
 
-	// Create config files
-	node1CfgPath = createNodeConfig(t, dir, node1Name, node1Port, node1Keys.SigningPrivate, node1Keys.HybridPrivate, masterKeys.SigningPublic, allPeers)
-	node2CfgPath = createNodeConfig(t, dir, node2Name, node2Port, node2Keys.SigningPrivate, node2Keys.HybridPrivate, masterKeys.SigningPublic, allPeers)
-	clientCfgPath = createNodeConfig(t, dir, clientName, "", "", "", masterKeys.SigningPublic, peersForClientConfig) // Client config doesn't need its own private keys
+	// We don't strictly need a separate client config file anymore if we provide targets to 'get',
+	// but the nodes' configs contain the necessary peer info (including client pubkey).
+	// If 'get' were to rely solely on --config, we would create one similar to node configs
+	// but without listen address and potentially without its own private keys listed.
 
-	return node1CfgPath, node2CfgPath, clientCfgPath
+	return node1CfgPath, node2CfgPath
 }
 
 // startTestDaemon starts a daemon process in the background.
@@ -274,23 +313,28 @@ func stopTestDaemon(t *testing.T, nodeName string, res *icmd.Result) {
 	// assert.Assert(t, state.Success(), "%s did not exit successfully", nodeName) // Allow non-zero exit on SIGTERM
 }
 
-// runPushCommand executes the push command.
-func runPushCommand(t *testing.T, masterSigningPriv, node1HybridPub, node2HybridPub string) {
+// runPushCommand executes the push command using the new config structure.
+func runPushCommand(t *testing.T, masterPrivKeyPath, nodeConfigPath string) {
 	t.Helper()
 	t.Log("Pushing secret...")
+	// Owners are derived from config, parts must match number of owners (peers) in config.
+	// Threshold must be <= parts.
+	// Readers are specified.
+	// Targets can be specified or derived from config.
+	numParts := 2 // Since we have node1 and node2 in the config
+	threshold := 2
 	pushCmd := icmd.Command("go", "run", ".", "push",
-		"--master-signing-key", masterSigningPriv,
-		"--owner", fmt.Sprintf("%s=%s:%d", node1Name, node1HybridPub, 2),
-		"--owner", fmt.Sprintf("%s=%s:%d", node2Name, node2HybridPub, 2),
+		"--master-private-key", masterPrivKeyPath,
+		"--config", nodeConfigPath, // Use one of the node configs to find peers/targets
 		"--reader", node1Name,
 		"--reader", node2Name,
 		"--reader", clientName,
 		"--key", testSecretKey,
 		"--secret", testSecretVal,
-		"--parts", "4",
-		"--threshold", "3",
-		"--target", node1Endpoint,
-		"--target", node2Endpoint,
+		"--parts", strconv.Itoa(numParts),
+		"--threshold", strconv.Itoa(threshold),
+		// "--target", node1Endpoint, // Optionally specify targets
+		// "--target", node2Endpoint,
 		"--loglevel", "info",
 	)
 	pushResult := icmd.RunCmd(pushCmd)
@@ -298,17 +342,18 @@ func runPushCommand(t *testing.T, masterSigningPriv, node1HybridPub, node2Hybrid
 	t.Log("Push command successful.")
 }
 
-// runGetCommand executes the get command.
-func runGetCommand(t *testing.T, clientSigningPriv, clientHybridPriv, clientCfgPath, outputFilePath string) {
+// runGetCommand executes the get command using the new config structure.
+func runGetCommand(t *testing.T, clientPrivKeyPath, nodeConfigPath, outputFilePath string) {
 	t.Helper()
 	t.Log("Getting secret...")
+	// Need client name, client private key, config (for peer endpoints), key, and target(s).
 	getCmd := icmd.Command("go", "run", ".", "get",
 		"--client-name", clientName,
-		"--signing-private-key", clientSigningPriv,
-		"--hybrid-private-key", clientHybridPriv,
-		"--config", clientCfgPath,
+		"--private-key", clientPrivKeyPath,
+		"--config", nodeConfigPath, // Use node config to find peer endpoints
 		"--key", testSecretKey,
-		"--target", node1Endpoint, // Target one node to start
+		// "--target", node1Endpoint, // Optionally specify targets
+		// "--target", node2Endpoint,
 		"--output", outputFilePath,
 		"--loglevel", "info",
 	)
@@ -325,8 +370,8 @@ func TestPushAndGetIntegration(t *testing.T) {
 	assert.NilError(t, err)
 
 	// --- Setup: Generate Keys and Configs ---
-	masterKeys, node1Keys, node2Keys, clientKeys := generateTestKeys(t, absTmpDir)
-	node1CfgPath, node2CfgPath, clientCfgPath := createTestConfigs(t, absTmpDir, masterKeys, node1Keys, node2Keys, clientKeys)
+	masterKeys, node1Keys, node2Keys, clientKeys := generateAllTestKeys(t, absTmpDir)
+	node1CfgPath, node2CfgPath := createTestConfigs(t, absTmpDir, masterKeys, node1Keys, node2Keys, clientKeys)
 
 	// --- Start Daemons ---
 	resNode1 := startTestDaemon(t, node1CfgPath, node1Name)
@@ -339,18 +384,22 @@ func TestPushAndGetIntegration(t *testing.T) {
 	t.Log("Waiting for daemons to start...")
 	waitForDaemon(t, node1Endpoint, 30*time.Second)
 	waitForDaemon(t, node2Endpoint, 30*time.Second)
-	time.Sleep(2 * time.Second) // Allow time for initial sync/connection attempts
+	// Increase sleep slightly to ensure peers likely connect and initial sync attempt happens
+	time.Sleep(pollInterval + 1*time.Second)
 	t.Log("Daemons appear ready.")
 
 	// --- Execute Push ---
-	runPushCommand(t, masterKeys.SigningPrivate, node1Keys.HybridPublic, node2Keys.HybridPublic)
+	// Use node1's config for push, it contains peer info for node2.
+	runPushCommand(t, masterKeys.PrivatePath, node1CfgPath)
 
-	// Allow time for potential synchronization
-	time.Sleep(time.Duration(6) * time.Second) // Wait longer than poll interval
+	// Allow time for synchronization
+	t.Logf("Waiting for sync (%s)...", pollInterval+1*time.Second)
+	time.Sleep(pollInterval + 1*time.Second) // Wait longer than poll interval
 
 	// --- Execute Get ---
 	outputFilePath := filepath.Join(absTmpDir, "retrieved_secret.txt")
-	runGetCommand(t, clientKeys.SigningPrivate, clientKeys.HybridPrivate, clientCfgPath, outputFilePath)
+	// Use node1's config for get, it contains peer info needed to find owner endpoints.
+	runGetCommand(t, clientKeys.PrivatePath, node1CfgPath, outputFilePath)
 
 	// --- Verify Secret ---
 	retrievedBytes, err := os.ReadFile(outputFilePath)

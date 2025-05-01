@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -18,151 +16,75 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// OwnerInfo holds the Name, hybrid public key path, and desired fragment count for an owner node.
-type OwnerInfo struct {
-	Name            string
-	HybridPublicKey string // Path to the public key used for encrypting fragments
-	Count           int    // Number of fragments this owner should receive
-}
-
 // Config holds the specific configuration needed for the push subcommand.
 type Config struct {
-	MasterSigningPrivateKey string   `kong:"name='master-signing-key',required,help='Path to the master private key JSON file (for signing entries).'"`
-	Owners                  []string `kong:"name='owner',optional,help='Owner node info as Name=HybridPublicKeyPath:Count (e.g., node1=owner1_hybrid_pub.json:2). Repeat for each owner. Total count must match --parts. Can be sourced from --config (count defaults to 1 if format is Name=Path).'"`
-	Readers                 []string `kong:"name='reader',required,help='Name of a node allowed to read the secret. Repeat for each reader.'"`
-	Key                     string   `kong:"name='key',required,help='The key name for the secret.'"`
-	Secret                  string   `kong:"name='secret',required,help='The secret value to store.'"`
-	Threshold               int      `kong:"name='threshold',short='t',required,help='Shamir threshold (number of fragments needed to reconstruct).'"`
-	Parts                   int      `kong:"name='parts',short='p',required,help='Total number of Shamir fragments to create (must match number of owners).'"`
-	Targets                 []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
-	ConfigPath              string   `kong:"name='config',optional,help='Path to a configuration file to load parameters from (owners, targets).'"`
+	MasterPrivateKeyPath string   `kong:"name='master-private-key',required,help='Path to the master private key JSON file (signing only).'"`
+	Readers              []string `kong:"name='reader',required,help='Name of a node allowed to read the secret. Repeat for each reader.'"`
+	Key                  string   `kong:"name='key',required,help='The key name for the secret.'"`
+	Secret               string   `kong:"name='secret',required,help='The secret value to store.'"`
+	Threshold            int      `kong:"name='threshold',short='t',required,help='Shamir threshold (number of fragments needed to reconstruct).'"`
+	Parts                int      `kong:"name='parts',short='p',required,help='Total number of Shamir fragments to create (must match number of peers in config).'"`
+	Targets              []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
+	ConfigPath           string   `kong:"name='config',required,help='Path to a configuration file to load parameters from (peers, targets).'"`
 	// LogLevel is handled globally
 }
 
-// parseOwner parses the Name=HybridPublicKeyPath[:Count] string. Count defaults to 1 if omitted.
-func parseOwner(ownerStr string) (*OwnerInfo, error) {
-	parts := strings.SplitN(ownerStr, "=", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return nil, fmt.Errorf("invalid owner format, expected Name=HybridPublicKeyPath[:Count], got %q", ownerStr)
-	}
-	name := parts[0]
-	pathAndCount := parts[1]
-
-	var path string
-	var countStr string
-	count := 1 // Default count
-
-	// Check if count is provided
-	countParts := strings.SplitN(pathAndCount, ":", 2)
-	if len(countParts) == 2 {
-		path = countParts[0]
-		countStr = countParts[1]
-		parsedCount, err := strconv.Atoi(countStr)
-		if err != nil || parsedCount <= 0 {
-			return nil, fmt.Errorf("invalid count %q for owner %q: must be a positive integer", countStr, name)
-		}
-		count = parsedCount
-	} else {
-		// No count provided, use default
-		path = pathAndCount
-	}
-
-	if path == "" {
-		return nil, fmt.Errorf("invalid owner format, missing public key path for Name %q in %q", name, ownerStr)
-	}
-
-	// Basic name validation could be added here if needed (e.g., non-empty)
-	return &OwnerInfo{Name: name, HybridPublicKey: path, Count: count}, nil
-}
-
-// loadConfigAndDeriveParams loads the configuration file if specified and updates
-// the push Config struct with owners and targets derived from the config if they weren't
-// provided via command-line flags. It returns the loaded app config or nil.
-func loadConfigAndDeriveParams(pushCfg *Config) (*config.Config, error) {
+// loadConfigAndDeriveTargets loads the configuration file and derives targets if needed.
+// Owners are now implicitly defined by the peers in the config file.
+func loadConfigAndDeriveTargets(pushCfg *Config) (*config.Config, error) {
 	if pushCfg.ConfigPath == "" {
-		return nil, nil // No config file specified, nothing to do
+		// Config path is now required by kong
+		return nil, errors.New("configuration file path is required")
 	}
 
 	slog.Info("Loading configuration file", "path", pushCfg.ConfigPath)
-	appCfg, err := config.LoadConfig(pushCfg.ConfigPath)
+	// Load config, ignoring own private key errors as push uses the master key
+	appCfg, err := config.LoadConfigIgnoreOwnKey(pushCfg.ConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load configuration file %q: %w", pushCfg.ConfigPath, err)
 	}
 	slog.Info("Configuration loaded successfully", "path", pushCfg.ConfigPath)
 
-	// Populate owners from config if not provided via flags
-	if len(pushCfg.Owners) == 0 {
-		slog.Debug("Populating owners from config file")
-		if appCfg.Peers == nil || len(appCfg.Peers) == 0 {
-			return nil, errors.New("config file specified but contains no peers to use as owners")
-		}
-		for name, peerCfg := range appCfg.Peers { // Iterate over name-keyed map
-			if peerCfg.HybridPublicKey == "" {
-				// This check might be redundant if LoadConfig enforces it, but good defense.
-				return nil, fmt.Errorf("peer %q in config file is missing hybrid_public_key path", name)
-			}
-			// Use the HybridPublicKey path for the owner string, format: Name=Path
-			// Count defaults to 1 when deriving from config this way.
-			pushCfg.Owners = append(pushCfg.Owners, fmt.Sprintf("%s=%s", name, peerCfg.HybridPublicKey))
-		}
-		slog.Info("Using owners derived from config file", "count", len(pushCfg.Owners))
-	}
-
 	// Populate targets from config if not provided via flags
 	if len(pushCfg.Targets) == 0 {
 		slog.Debug("Populating targets from config file")
-		if appCfg.Peers == nil || len(appCfg.Peers) == 0 {
+		if appCfg.LoadedPeers == nil || len(appCfg.LoadedPeers) == 0 {
 			return nil, errors.New("config file specified but contains no peers to use as targets")
 		}
 		// Endpoints are validated during config.LoadConfig, so we assume they exist here.
-		for _, peerCfg := range appCfg.Peers { // Iterate over original Peers map
-			pushCfg.Targets = append(pushCfg.Targets, peerCfg.Endpoint)
+		for name, peerCfg := range appCfg.LoadedPeers {
+			if peerCfg.Endpoint != "" { // Only add peers with endpoints as targets
+				pushCfg.Targets = append(pushCfg.Targets, peerCfg.Endpoint)
+			} else {
+				slog.Debug("Skipping peer as target (no endpoint defined)", "peer_name", name)
+			}
 		}
 		slog.Info("Using targets derived from config file", "count", len(pushCfg.Targets))
 	}
 	return appCfg, nil
 }
 
-// loadOwnerKeys parses owner strings, loads their hybrid public keys, and validates counts.
-func loadOwnerKeys(ownerStrings []string, parts int) ([]*OwnerInfo, map[string]tink.HybridEncrypt, error) {
-	ownerHybridEncrypters := make(map[string]tink.HybridEncrypt) // Map: Name -> Encrypter
-	ownerInfos := make([]*OwnerInfo, 0, len(ownerStrings))
-	ownerNameSet := make(map[string]struct{}) // To check for duplicate names
-	totalFragmentCountSpecified := 0
-
-	for _, ownerStr := range ownerStrings {
-		ownerInfo, err := parseOwner(ownerStr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to parse owner info %q: %w", ownerStr, err)
+// prepareFragments splits the secret and encrypts fragments for each owner peer defined in the config.
+func prepareFragments(secret string, parts, threshold int, appCfg *config.Config) (map[string]*pb.FragmentList, error) {
+	// Identify owner peers (those with loaded encrypters AND endpoints in the config)
+	ownerPeers := make(map[string]*config.PeerConfig)
+	for name, peerCfg := range appCfg.LoadedPeers {
+		// An owner must have an encrypter AND an endpoint to receive the push.
+		if peerCfg.PubKeyEncrypter != nil && peerCfg.Endpoint != "" {
+			ownerPeers[name] = peerCfg
+		} else {
+			slog.Debug("Peer does not qualify as an owner (missing encrypter or endpoint)", "peer_name", name, "has_encrypter", peerCfg.PubKeyEncrypter != nil, "has_endpoint", peerCfg.Endpoint != "")
 		}
-		if _, exists := ownerNameSet[ownerInfo.Name]; exists {
-			return nil, nil, fmt.Errorf("duplicate owner Name specified: %q", ownerInfo.Name)
-		}
-		ownerNameSet[ownerInfo.Name] = struct{}{}
-		ownerInfos = append(ownerInfos, ownerInfo) // Keep order for fragment assignment
-
-		// Load the hybrid public key using the path from the owner string
-		slog.Debug("Loading owner hybrid public key", "name", ownerInfo.Name, "path", ownerInfo.HybridPublicKey)
-		encrypter, err := crypto.LoadOwnerPublicKeyEncrypter(ownerInfo.HybridPublicKey)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to load owner hybrid public key for %q (%s): %w", ownerInfo.Name, ownerInfo.HybridPublicKey, err)
-		}
-		ownerHybridEncrypters[ownerInfo.Name] = encrypter
-		totalFragmentCountSpecified += ownerInfo.Count
-		slog.Info("Loaded owner hybrid public key", "name", ownerInfo.Name, "count", ownerInfo.Count)
 	}
-
-	// Validate Total Fragment Count
-	if totalFragmentCountSpecified != parts {
-		return nil, nil, fmt.Errorf("total fragment count specified by owners (%d) does not match --parts (%d)",
-			totalFragmentCountSpecified, parts)
+	numOwners := len(ownerPeers)
+	if numOwners == 0 {
+		return nil, errors.New("no owner peers found in configuration (peers with public keys)")
 	}
+	if parts != numOwners {
+		return nil, fmt.Errorf("number of parts (%d) must match the number of owner peers defined in the config file (%d)", parts, numOwners)
+	}
+	slog.Info("Identified owner peers from config", "count", numOwners, "names", ownerPeers) // Consider logging names if not too many
 
-	return ownerInfos, ownerHybridEncrypters, nil
-}
-
-// prepareFragments splits the secret and encrypts fragments for each owner.
-func prepareFragments(secret string, parts, threshold int, ownerInfos []*OwnerInfo, ownerHybridEncrypters map[string]tink.HybridEncrypt) (map[string]*pb.FragmentList, error) {
 	slog.Debug("Splitting secret", "parts", parts, "threshold", threshold)
 	fragments, err := crypto.SplitSecret([]byte(secret), parts, threshold)
 	if err != nil {
@@ -170,48 +92,38 @@ func prepareFragments(secret string, parts, threshold int, ownerInfos []*OwnerIn
 	}
 	slog.Info("Secret split into fragments", "count", len(fragments))
 
-	// Encrypt Fragments
+	// Encrypt Fragments and distribute round-robin
 	ownerEncryptedFragments := make(map[string]*pb.FragmentList)
-	numOwners := len(ownerInfos)
-	if numOwners == 0 {
-		return nil, errors.New("internal error: No owner info available for fragment encryption")
-	}
-	if len(fragments) != parts {
-		return nil, fmt.Errorf("internal error: fragment count mismatch (%d) vs expected parts (%d)", len(fragments), parts)
-	}
-
-	slog.Info("Encrypting and distributing fragments according to owner counts", "fragment_count", len(fragments), "owner_count", numOwners)
 	fragmentIndex := 0
-	for _, ownerInfo := range ownerInfos {
-		encrypter, ok := ownerHybridEncrypters[ownerInfo.Name]
-		if !ok {
-			// Should not happen if loadOwnerKeys worked correctly
-			return nil, fmt.Errorf("internal error: missing encrypter for owner %q", ownerInfo.Name)
+	for ownerName, ownerCfg := range ownerPeers {
+		if ownerCfg.PubKeyEncrypter == nil {
+			// Should have been filtered already, but double-check
+			return nil, fmt.Errorf("internal error: missing encrypter for owner %q", ownerName)
 		}
-		slog.Debug("Assigning fragments to owner", "owner_name", ownerInfo.Name, "count", ownerInfo.Count)
+		encrypter := ownerCfg.PubKeyEncrypter
 
-		// Initialize the list for this owner
-		ownerEncryptedFragments[ownerInfo.Name] = &pb.FragmentList{Fragments: make([][]byte, 0, ownerInfo.Count)}
-
-		for range ownerInfo.Count {
-			if fragmentIndex >= len(fragments) {
-				return nil, fmt.Errorf("internal error: Not enough fragments generated for distribution (needed %d, generated %d)", parts, len(fragments))
-			}
-			fragment := fragments[fragmentIndex]
-
-			slog.Debug("Encrypting fragment for owner", "fragment_index", fragmentIndex, "assigned_owner_name", ownerInfo.Name)
-			encrypted, err := crypto.EncryptFragment(encrypter, fragment)
-			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt fragment %d for owner %q (%s): %w",
-					fragmentIndex, ownerInfo.Name, ownerInfo.HybridPublicKey, err)
-			}
-
-			// Append the encrypted fragment to the list for this owner
-			ownerEncryptedFragments[ownerInfo.Name].Fragments = append(ownerEncryptedFragments[ownerInfo.Name].Fragments, encrypted)
-			slog.Debug("Appended encrypted fragment to owner's list", "fragment_index", fragmentIndex, "owner_name", ownerInfo.Name, "list_size_now", len(ownerEncryptedFragments[ownerInfo.Name].Fragments))
-			fragmentIndex++
+		// Assign one fragment per owner in this simplified round-robin distribution
+		if fragmentIndex >= len(fragments) {
+			return nil, fmt.Errorf("internal error: Not enough fragments generated for distribution (needed %d, generated %d)", parts, len(fragments))
 		}
+		fragment := fragments[fragmentIndex]
+
+		slog.Debug("Encrypting fragment for owner", "fragment_index", fragmentIndex, "owner_name", ownerName)
+		encrypted, err := crypto.EncryptFragment(encrypter, fragment)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encrypt fragment %d for owner %q (%s): %w",
+				fragmentIndex, ownerName, ownerCfg.PublicKeyPath, err)
+		}
+
+		// Initialize list if needed and append
+		if _, ok := ownerEncryptedFragments[ownerName]; !ok {
+			ownerEncryptedFragments[ownerName] = &pb.FragmentList{Fragments: make([][]byte, 0, 1)} // Expecting 1 fragment per owner now
+		}
+		ownerEncryptedFragments[ownerName].Fragments = append(ownerEncryptedFragments[ownerName].Fragments, encrypted)
+		slog.Debug("Appended encrypted fragment to owner's list", "fragment_index", fragmentIndex, "owner_name", ownerName, "list_size_now", len(ownerEncryptedFragments[ownerName].Fragments))
+		fragmentIndex++
 	}
+
 	// Sanity check: ensure all fragments were assigned
 	if fragmentIndex != len(fragments) {
 		return nil, fmt.Errorf("internal error: Fragment count mismatch after distribution (assigned %d, total %d)", fragmentIndex, len(fragments))
@@ -227,7 +139,7 @@ func buildAndSignEntry(pushCfg *Config, ownerEncryptedFragments map[string]*pb.F
 		Key:            pushCfg.Key,
 		Readers:        pushCfg.Readers, // Already a slice of strings
 		OwnerFragments: ownerEncryptedFragments,
-		Threshold:      int32(pushCfg.Threshold), // Store the threshold
+		Threshold:      int32(pushCfg.Threshold),
 		// Signature will be added next
 	}
 	slog.Debug("Constructed entry structure", "key", entry.Key, "timestamp", entry.Timestamp.AsTime(), "threshold", entry.Threshold)
@@ -301,22 +213,20 @@ func pushEntryToTargets(targets []string, entry *pb.Entry) (successCount, errorC
 func Run(pushCfg *Config) int {
 	slog.Info("Starting push operation...")
 
-	// --- Load Config if specified and derive parameters ---
-	_, err := loadConfigAndDeriveParams(pushCfg)
+	// --- Load Config and derive targets ---
+	appCfg, err := loadConfigAndDeriveTargets(pushCfg)
 	if err != nil {
 		slog.Error("Failed to load or process configuration", "err", err)
 		return 1
 	}
 
 	// --- Validate Inputs (Post-Config Load/Derivation) ---
-	if len(pushCfg.Owners) == 0 {
-		slog.Error("No owners specified. Provide via --owner flags or --config file.")
-		return 1
-	}
+	// Parts validation happens implicitly in prepareFragments now
 	if pushCfg.Parts <= 0 {
 		slog.Error("Number of parts must be positive", "parts", pushCfg.Parts)
 		return 1
 	}
+	// Threshold validation remains
 	if pushCfg.Threshold > pushCfg.Parts {
 		slog.Error("Threshold cannot be greater than the number of parts", "threshold", pushCfg.Threshold, "parts", pushCfg.Parts)
 		return 1
@@ -330,28 +240,23 @@ func Run(pushCfg *Config) int {
 		return 1
 	}
 	if len(pushCfg.Targets) == 0 {
-		slog.Error("No targets specified. Provide via --target flags or --config file.")
+		slog.Error("No targets specified. Provide via --target flags or derive from --config file.")
 		return 1
 	}
 
 	// --- Load Master Signing Key ---
-	slog.Debug("Loading master signing private key", "path", pushCfg.MasterSigningPrivateKey)
-	masterSigner, err := crypto.LoadMasterPrivateKeySigner(pushCfg.MasterSigningPrivateKey)
+	slog.Debug("Loading master private key (signer)", "path", pushCfg.MasterPrivateKeyPath)
+	// Use the generic LoadSigner function
+	masterSigner, err := crypto.LoadSigner(pushCfg.MasterPrivateKeyPath)
 	if err != nil {
-		slog.Error("Failed to load master signing private key", "path", pushCfg.MasterSigningPrivateKey, "err", err)
+		slog.Error("Failed to load master private key (signer)", "path", pushCfg.MasterPrivateKeyPath, "err", err)
 		return 1
 	}
-	slog.Info("Loaded master signing private key successfully")
-
-	// --- Parse Owner Info and Load Keys ---
-	ownerInfos, ownerHybridEncrypters, err := loadOwnerKeys(pushCfg.Owners, pushCfg.Parts)
-	if err != nil {
-		slog.Error("Failed to load owner keys or validate counts", "err", err)
-		return 1
-	}
+	slog.Info("Loaded master private key (signer) successfully")
 
 	// --- Split Secret and Encrypt Fragments ---
-	ownerEncryptedFragments, err := prepareFragments(pushCfg.Secret, pushCfg.Parts, pushCfg.Threshold, ownerInfos, ownerHybridEncrypters)
+	// Owners and their keys are derived directly from appCfg
+	ownerEncryptedFragments, err := prepareFragments(pushCfg.Secret, pushCfg.Parts, pushCfg.Threshold, appCfg)
 	if err != nil {
 		slog.Error("Failed to prepare fragments", "err", err)
 		return 1
