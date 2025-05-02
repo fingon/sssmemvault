@@ -1,11 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 
 	"github.com/alecthomas/kong"
-	"github.com/fingon/sssmemvault/internal/cliutil"
 	"github.com/fingon/sssmemvault/internal/daemon"
 	"github.com/fingon/sssmemvault/internal/genkeys"
 	"github.com/fingon/sssmemvault/internal/get"
@@ -33,6 +33,30 @@ var cli struct {
 	GenKeys genkeys.Config `kong:"cmd,help='Generate combined private and public keyset files.'"`
 }
 
+// SetupLogging configures the global slog logger based on the provided level string.
+func SetupLogging(logLevel string) error {
+	var level slog.Level
+	switch logLevel {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		// This should ideally be caught by CLI validation (e.g., kong enum)
+		return fmt.Errorf("invalid log level: %s", logLevel)
+	}
+	// Log to stderr for CLI tools, stdout for daemon potentially
+	// For simplicity, using stderr for all now. Can be adjusted.
+	logHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	slog.SetDefault(slog.New(logHandler))
+	slog.Debug("Logging setup complete", "level", logLevel)
+	return nil
+}
+
 func main() {
 	kctx := kong.Parse(&cli,
 		kong.Name("sssmemvault"),
@@ -45,15 +69,11 @@ func main() {
 
 	// --- Setup Logging ---
 	// Do this *after* parsing flags so LogLevel is available.
-	if err := cliutil.SetupLogging(cli.LogLevel); err != nil {
+	if err := SetupLogging(cli.LogLevel); err != nil {
 		// Use fmt directly as logging might not be set up
 		_, _ = os.Stderr.WriteString("Error setting up logging: " + err.Error() + "\n") // Best effort write
 		os.Exit(1)
 	}
-
-	// --- Ensure Tink Primitives Registered ---
-	// Log a reminder, actual registration happens via imports above.
-	cliutil.EnsureTinkPrimitivesRegistered()
 
 	// --- Execute Command ---
 	var exitCode int
