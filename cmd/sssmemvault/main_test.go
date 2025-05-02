@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync" // Add missing import
 	"syscall"
 	"testing"
 	"time"
@@ -32,21 +33,31 @@ const (
 	testSecretVal = "super-secret-value-shhh"
 	node1Name     = "test-node-1"
 	node2Name     = "test-node-2"
+	node3Name     = "test-node-3" // Added for the 3-node test
 	clientName    = "test-client-1"
 	nodeIP        = "127.0.0.1"
-	node1Port     = "59251" // Use distinct ports
-	node2Port     = "59252"
 	pollInterval  = 2 * time.Second // Faster polling for test
 )
 
-var (
-	node1Endpoint = net.JoinHostPort(nodeIP, node1Port)
-	node2Endpoint = net.JoinHostPort(nodeIP, node2Port)
-)
-
-// peerInfo holds paths needed for peer configuration.
+// peerInfo holds paths and endpoint needed for peer configuration.
 type peerInfo struct {
+	Name          string
 	PublicKeyPath string // Combined public keyset (signing + hybrid)
+	Endpoint      string // e.g., "127.0.0.1:59251" (empty for client)
+	Port          string // e.g., "59251" (empty for client)
+}
+
+// testKeys holds paths to generated keys for a single entity (node/client/master).
+type testKeys struct {
+	PrivatePath string
+	PublicPath  string
+}
+
+// testNode represents a running daemon instance.
+type testNode struct {
+	Name    string
+	CfgPath string
+	Result  *icmd.Result
 }
 
 // generateCombinedKeyset generates combined private and public keyset files.
@@ -98,10 +109,10 @@ func generateCombinedKeyset(t *testing.T, dir, name string) (privPath, pubPath s
 }
 
 // generateMasterKeys generates the master signing key pair (signing only).
-func generateMasterKeys(t *testing.T, dir string) (privPath, pubPath string) {
+func generateMasterKeys(t *testing.T, dir string) testKeys {
 	t.Helper()
-	privPath = filepath.Join(dir, "master_private.json")
-	pubPath = filepath.Join(dir, "master_public.json")
+	privPath := filepath.Join(dir, "master_private.json")
+	pubPath := filepath.Join(dir, "master_public.json")
 
 	handle, err := keyset.NewHandle(signature.ED25519KeyTemplate())
 	assert.NilError(t, err, "Failed to create master keyset handle")
@@ -124,52 +135,37 @@ func generateMasterKeys(t *testing.T, dir string) (privPath, pubPath string) {
 	err = os.WriteFile(pubPath, pubBuf.Bytes(), 0o600)
 	assert.NilError(t, err, "Failed to save master public keyset file")
 
-	return privPath, pubPath
+	return testKeys{PrivatePath: privPath, PublicPath: pubPath}
 }
 
 // createNodeConfig creates a YAML config file for a daemon node.
-func createNodeConfig(t *testing.T, dir, name, myPort, myPrivateKeyPath, masterPubKeyPath string, peers map[string]peerInfo) string {
+// It includes all provided peers in the 'peers' section.
+func createNodeConfig(t *testing.T, dir string, node peerInfo, nodePrivKeyPath, masterPubKeyPath string, allPeers []peerInfo) string {
 	t.Helper()
-	cfgPath := filepath.Join(dir, name+"_config.yaml")
-	listenAddr := net.JoinHostPort("", myPort) // Listen on all interfaces for the given port
+	cfgPath := filepath.Join(dir, node.Name+"_config.yaml")
+	listenAddr := net.JoinHostPort("", node.Port) // Listen on all interfaces for the given port
 
-	peerConfigs := make(map[string]config.PeerConfig) // Map key is now peer name
+	peerConfigs := make(map[string]config.PeerConfig) // Map key is peer name
 	pollDuration := pollInterval                      // Use defined duration
-	for peerName, peerData := range peers {
-		// Determine endpoint based on Name - assumes test setup uses specific ports/endpoints
-		var endpoint string
-		switch peerName {
-		case node1Name:
-			endpoint = node1Endpoint
-		case node2Name:
-			endpoint = node2Endpoint
-		case clientName:
-			endpoint = "" // Client doesn't listen, no endpoint needed in peer config for it
-		default:
-			t.Fatalf("Unknown peer name in test setup: %s", peerName)
-		}
 
-		// Add all peers (nodes and client) to the config
+	for _, p := range allPeers {
 		peerCfg := config.PeerConfig{
-			PublicKeyPath: peerData.PublicKeyPath, // Use absolute path
-			Endpoint:      endpoint,               // Set endpoint (can be empty for client)
+			PublicKeyPath: p.PublicKeyPath, // Use absolute path
+			Endpoint:      p.Endpoint,      // Use endpoint from peerInfo (can be empty for client)
 		}
 
-		// Set poll interval only for actual peer nodes, not the client or self
-		// Note: The current node's own entry in `peers` is usually ignored by the synchronizer,
-		// but setting PollInterval doesn't hurt. Client entry should not have it.
-		if endpoint != "" && peerName != clientName {
-			// Make a copy of the duration for the pointer
+		// Set poll interval only for actual peer nodes (those with an endpoint), not the client or self.
+		if p.Endpoint != "" && p.Name != node.Name {
 			interval := pollDuration
 			peerCfg.PollInterval = &interval
 		} else {
 			peerCfg.PollInterval = nil
 		}
-		peerConfigs[peerName] = peerCfg
+		peerConfigs[p.Name] = peerCfg
 	}
 
 	nodeCfg := config.Config{
-		PrivateKeyPath:      myPrivateKeyPath, // Use absolute path
+		PrivateKeyPath:      nodePrivKeyPath,  // Use absolute path
 		MasterPublicKeyPath: masterPubKeyPath, // Use absolute path
 		ListenAddress:       listenAddr,
 		MaxTimestampSkew:    30 * time.Second,
@@ -177,10 +173,13 @@ func createNodeConfig(t *testing.T, dir, name, myPort, myPrivateKeyPath, masterP
 	}
 
 	yamlData, err := yaml.Marshal(nodeCfg)
-	assert.NilError(t, err, "Failed to marshal config for %s", name)
+	assert.NilError(t, err, "Failed to marshal config for %s", node.Name)
+
+	// Log the generated config content for debugging
+	t.Logf("Generated config for %s (%s):\n%s", node.Name, cfgPath, string(yamlData))
 
 	err = os.WriteFile(cfgPath, yamlData, 0o600)
-	assert.NilError(t, err, "Failed to write config file for %s", name)
+	assert.NilError(t, err, "Failed to write config file for %s", node.Name)
 
 	return cfgPath
 }
@@ -230,183 +229,267 @@ func waitForDaemon(t *testing.T, endpoint string, timeout time.Duration) {
 
 // --- Test Setup Helpers ---
 
-// testKeys holds paths to generated keys for a single entity (node/client/master).
-type testKeys struct {
-	PrivatePath string
-	PublicPath  string
-}
-
-// generateAllTestKeys generates all necessary keys for the integration test.
-func generateAllTestKeys(t *testing.T, dir string) (masterKeys, node1Keys, node2Keys, clientKeys testKeys) {
+// setupTestEnvironment generates keys and configs for a given set of node names.
+func setupTestEnvironment(t *testing.T, nodeNames []string, ofs int) (
+	masterKeys testKeys,
+	clientKeys testKeys,
+	nodeInfos map[string]peerInfo, // Map: Node Name -> Peer Info
+	nodeKeyPaths map[string]string, // Map: Node Name -> Private Key Path
+	nodeCfgPaths map[string]string, // Map: Node Name -> Config Path
+) {
 	t.Helper()
-	// Master key (signing only) - still generate separate for clarity, though config uses combined format
-	masterKeys.PrivatePath, masterKeys.PublicPath = generateMasterKeys(t, dir) // Use specific master key gen
+	tmpDir := t.TempDir()
+	absTmpDir, err := filepath.Abs(tmpDir)
+	assert.NilError(t, err)
 
-	// Node 1 keys (combined)
-	node1Keys.PrivatePath, node1Keys.PublicPath = generateCombinedKeyset(t, dir, node1Name)
+	// Generate Master Key
+	masterKeys = generateMasterKeys(t, absTmpDir)
 
-	// Node 2 keys (combined)
-	node2Keys.PrivatePath, node2Keys.PublicPath = generateCombinedKeyset(t, dir, node2Name)
+	// Generate Client Key
+	clientPrivPath, clientPubPath := generateCombinedKeyset(t, absTmpDir, clientName)
+	clientKeys = testKeys{PrivatePath: clientPrivPath, PublicPath: clientPubPath}
+	clientInfo := peerInfo{Name: clientName, PublicKeyPath: clientPubPath, Endpoint: "", Port: ""} // Client has no endpoint/port
 
-	// Client keys (combined)
-	clientKeys.PrivatePath, clientKeys.PublicPath = generateCombinedKeyset(t, dir, clientName)
+	// Generate Node Keys and Collect Peer Info
+	nodeInfos = make(map[string]peerInfo)
+	nodeKeyPaths = make(map[string]string)
+	allPeers := []peerInfo{clientInfo} // Start with client info
 
-	return masterKeys, node1Keys, node2Keys, clientKeys
-}
-
-// createTestConfigs creates the necessary config files for nodes.
-// Client config is no longer strictly needed by the client itself if targets are specified,
-// but nodes still need the client's public key info in their peer list.
-func createTestConfigs(t *testing.T, dir string, masterKeys, node1Keys, node2Keys, clientKeys testKeys) (node1CfgPath, node2CfgPath string) {
-	t.Helper()
-	// Define peer public key info needed by each node config
-	node1PeerInfo := peerInfo{PublicKeyPath: node1Keys.PublicPath}
-	node2PeerInfo := peerInfo{PublicKeyPath: node2Keys.PublicPath}
-	clientPeerInfo := peerInfo{PublicKeyPath: clientKeys.PublicPath}
-
-	// Define all known peers for config generation (using names as keys)
-	allPeers := map[string]peerInfo{
-		node1Name:  node1PeerInfo,
-		node2Name:  node2PeerInfo,
-		clientName: clientPeerInfo, // Nodes need client info for auth/encryption
+	nodePorts := map[string]string{}
+	for i, nodeName := range nodeNames {
+		nodePorts[nodeName] = strconv.Itoa(59123 + ofs + i)
+	}
+	nodeEndpoints := map[string]string{}
+	for k, v := range nodePorts {
+		nodeEndpoints[k] = net.JoinHostPort(nodeIP, v)
 	}
 
-	// Create config files for nodes
-	node1CfgPath = createNodeConfig(t, dir, node1Name, node1Port, node1Keys.PrivatePath, masterKeys.PublicPath, allPeers)
-	node2CfgPath = createNodeConfig(t, dir, node2Name, node2Port, node2Keys.PrivatePath, masterKeys.PublicPath, allPeers)
+	for _, name := range nodeNames {
+		privPath, pubPath := generateCombinedKeyset(t, absTmpDir, name)
+		nodeKeyPaths[name] = privPath
+		info := peerInfo{
+			Name:          name,
+			PublicKeyPath: pubPath,
+			Endpoint:      nodeEndpoints[name],
+			Port:          nodePorts[name],
+		}
+		nodeInfos[name] = info
+		allPeers = append(allPeers, info)
+	}
 
-	// We don't strictly need a separate client config file anymore if we provide targets to 'get',
-	// but the nodes' configs contain the necessary peer info (including client pubkey).
-	// If 'get' were to rely solely on --config, we would create one similar to node configs
-	// but without listen address and potentially without its own private keys listed.
+	// Create Node Config Files
+	nodeCfgPaths = make(map[string]string)
+	for _, name := range nodeNames {
+		nodeInfo := nodeInfos[name]
+		t.Logf("Generating config for node %s using PeerInfo: %+v", name, nodeInfo) // Log PeerInfo
+		nodeCfgPaths[name] = createNodeConfig(t, absTmpDir, nodeInfo, nodeKeyPaths[name], masterKeys.PublicPath, allPeers)
+	}
 
-	return node1CfgPath, node2CfgPath
+	return masterKeys, clientKeys, nodeInfos, nodeKeyPaths, nodeCfgPaths
 }
 
-// startTestDaemon starts a daemon process in the background.
-func startTestDaemon(t *testing.T, cfgPath, nodeName string) *icmd.Result {
+// startDaemons starts daemon processes for the given nodes and returns a map of running nodes.
+func startDaemons(t *testing.T, nodeInfos map[string]peerInfo, nodeCfgPaths map[string]string) map[string]*testNode {
 	t.Helper()
-	cmd := icmd.Command("go", "run", ".", "daemon",
-		"--config", cfgPath,
-		"--my-name", nodeName,
-		"--loglevel", "debug",
-	)
-	res := icmd.StartCmd(cmd)
-	t.Logf("Started %s (PID %d)", nodeName, res.Cmd.Process.Pid)
-	return res
+	runningNodes := make(map[string]*testNode)
+	for name, info := range nodeInfos {
+		cfgPath := nodeCfgPaths[name]
+		cmd := icmd.Command("go", "run", ".", "daemon",
+			"--config", cfgPath,
+			"--my-name", name,
+			"--loglevel", "debug",
+		)
+		res := icmd.StartCmd(cmd)
+		t.Logf("Started %s (PID %d) listening on %s", name, res.Cmd.Process.Pid, info.Endpoint)
+		runningNode := &testNode{Name: name, CfgPath: cfgPath, Result: res}
+		runningNodes[name] = runningNode
+		// Add cleanup for each started daemon
+		t.Cleanup(func() { stopDaemon(t, runningNode) })
+	}
+	return runningNodes
 }
 
-// stopTestDaemon stops a daemon process gracefully.
-func stopTestDaemon(t *testing.T, nodeName string, res *icmd.Result) {
+// stopDaemon stops a single daemon process gracefully.
+func stopDaemon(t *testing.T, node *testNode) {
 	t.Helper()
-	t.Logf("Cleaning up %s...", nodeName)
-	err := res.Cmd.Process.Signal(syscall.SIGTERM) // Send SIGTERM for graceful shutdown
-	assert.NilError(t, err, "Failed to send SIGTERM to %s", nodeName)
+	// Check if process is already finished
+	if node.Result.Cmd == nil || node.Result.Cmd.ProcessState != nil {
+		t.Logf("Daemon %s already stopped.", node.Name)
+		return
+	}
+	t.Logf("Stopping daemon %s (PID %d)...", node.Name, node.Result.Cmd.Process.Pid)
+	err := node.Result.Cmd.Process.Signal(syscall.SIGTERM) // Send SIGTERM for graceful shutdown
+	assert.NilError(t, err, "Failed to send SIGTERM to %s", node.Name)
+
 	// Wait for process to exit, check status
-	state, waitErr := res.Cmd.Process.Wait()
-	assert.NilError(t, waitErr, "Error waiting for %s to exit", nodeName)
-	t.Logf("%s exited: %s", nodeName, state)
+	state, waitErr := node.Result.Cmd.Process.Wait()
+	assert.NilError(t, waitErr, "Error waiting for %s to exit", node.Name)
+	t.Logf("%s exited: %s", node.Name, state)
 	if !state.Success() {
-		t.Logf("%s stderr:\n%s", nodeName, res.Stderr())
-		t.Logf("%s stdout:\n%s", nodeName, res.Stdout())
+		// Log output only if exit was not successful (SIGTERM often results in non-zero exit)
+		t.Logf("%s stderr:\n%s", node.Name, node.Result.Stderr())
+		t.Logf("%s stdout:\n%s", node.Name, node.Result.Stdout())
 	}
-	// assert.Assert(t, state.Success(), "%s did not exit successfully", nodeName) // Allow non-zero exit on SIGTERM
+
+	// Second stop will abort early
+	node.Result.Cmd = nil
 }
 
-// runPushCommand executes the push command using the new config structure.
-func runPushCommand(t *testing.T, masterPrivKeyPath, nodeConfigPath string) {
+// waitForDaemons waits for all specified daemons to become available.
+func waitForDaemons(t *testing.T, nodes map[string]*testNode, nodeInfos map[string]peerInfo, timeout time.Duration) { // Add nodeInfos parameter
 	t.Helper()
-	t.Log("Pushing secret...")
-	// Owners are derived from config, parts must match number of owners (peers) in config.
-	// Threshold must be <= parts.
-	// Readers are specified.
-	// Targets can be specified or derived from config.
-	numParts := 2 // Since we have node1 and node2 in the config
-	threshold := 2
-	pushCmd := icmd.Command("go", "run", ".", "push",
+	var wg sync.WaitGroup
+	for _, node := range nodes {
+		// Get endpoint from nodeInfos map using the node's name
+		info, ok := nodeInfos[node.Name]
+		if !ok || info.Endpoint == "" {
+			t.Fatalf("Could not find endpoint information for node %s in nodeInfos map", node.Name)
+		}
+		endpoint := info.Endpoint
+
+		wg.Add(1)
+		go func(ep string) { // Pass endpoint directly to goroutine
+			defer wg.Done()
+			waitForDaemon(t, ep, timeout)
+		}(endpoint)
+	}
+	wg.Wait()
+	// Increase sleep slightly to ensure peers likely connect and initial sync attempt happens
+	time.Sleep(pollInterval + 1*time.Second)
+	t.Log("All specified daemons appear ready.")
+}
+
+// runPushCommand executes the push command.
+func runPushCommand(t *testing.T, masterPrivKeyPath, configPath string, parts, threshold int, readers []string, secretKey, secretValue string) {
+	t.Helper()
+	t.Logf("Pushing secret '%s' (parts=%d, threshold=%d)...", secretKey, parts, threshold)
+
+	args := []string{
+		"run", ".", "push",
 		"--master-private-key", masterPrivKeyPath,
-		"--config", nodeConfigPath, // Use one of the node configs to find peers/targets
-		"--reader", node1Name,
-		"--reader", node2Name,
-		"--reader", clientName,
-		"--key", testSecretKey,
-		"--secret", testSecretVal,
-		"--parts", strconv.Itoa(numParts),
+		"--config", configPath, // Config provides owner/target info
+		"--key", secretKey,
+		"--secret", secretValue,
+		"--parts", strconv.Itoa(parts),
 		"--threshold", strconv.Itoa(threshold),
-		// "--target", node1Endpoint, // Optionally specify targets
-		// "--target", node2Endpoint,
 		"--loglevel", "info",
-	)
+	}
+	for _, r := range readers {
+		args = append(args, "--reader", r)
+	}
+	// Targets are derived from config by default now
+
+	pushCmd := icmd.Command("go", args...)
 	pushResult := icmd.RunCmd(pushCmd)
 	pushResult.Assert(t, icmd.Success)
-	t.Log("Push command successful.")
+	t.Logf("Push command for key '%s' successful.", secretKey)
 }
 
-// runGetCommand executes the get command using the new config structure.
-func runGetCommand(t *testing.T, clientPrivKeyPath, nodeConfigPath, outputFilePath string) {
+// runGetCommand executes the get command.
+func runGetCommand(t *testing.T, clientName, clientPrivKeyPath, configPath, secretKey, outputFilePath string) {
 	t.Helper()
-	t.Log("Getting secret...")
-	// Need client name, client private key, config (for peer endpoints), key, and target(s).
+	t.Logf("Getting secret '%s'...", secretKey)
+	// Need client name, client private key, config (for peer endpoints), key.
+	// Targets are derived from config by default now.
 	getCmd := icmd.Command("go", "run", ".", "get",
 		"--client-name", clientName,
 		"--private-key", clientPrivKeyPath,
-		"--config", nodeConfigPath, // Use node config to find peer endpoints
-		"--key", testSecretKey,
-		// "--target", node1Endpoint, // Optionally specify targets
-		// "--target", node2Endpoint,
+		"--config", configPath, // Use config to find peer endpoints
+		"--key", secretKey,
 		"--output", outputFilePath,
 		"--loglevel", "info",
 	)
 	getResult := icmd.RunCmd(getCmd)
 	getResult.Assert(t, icmd.Success)
-	t.Log("Get command successful.")
+	t.Logf("Get command for key '%s' successful.", secretKey)
 }
 
-// --- Main Test Function ---
+// verifySecret checks if the content of the output file matches the expected secret.
+func verifySecret(t *testing.T, outputFilePath, expectedSecret string) {
+	t.Helper()
+	retrievedBytes, err := os.ReadFile(outputFilePath)
+	assert.NilError(t, err, "Failed to read output file: %s", outputFilePath)
+	assert.Equal(t, string(retrievedBytes), expectedSecret, "Retrieved secret does not match original")
+	t.Logf("Secret verification successful for file: %s", outputFilePath)
+}
 
-func TestPushAndGetIntegration(t *testing.T) {
-	tmpDir := t.TempDir()
-	absTmpDir, err := filepath.Abs(tmpDir)
-	assert.NilError(t, err)
+// --- Test Functions ---
 
-	// --- Setup: Generate Keys and Configs ---
-	masterKeys, node1Keys, node2Keys, clientKeys := generateAllTestKeys(t, absTmpDir)
-	node1CfgPath, node2CfgPath := createTestConfigs(t, absTmpDir, masterKeys, node1Keys, node2Keys, clientKeys)
+// TestPushAndGetIntegration_TwoNodes tests the basic 2-node push/get scenario.
+func TestPushAndGetIntegration_TwoNodes(t *testing.T) {
+	t.Parallel()
 
-	// --- Start Daemons ---
-	resNode1 := startTestDaemon(t, node1CfgPath, node1Name)
-	t.Cleanup(func() { stopTestDaemon(t, node1Name, resNode1) })
+	nodeNames := []string{node1Name, node2Name}
+	masterKeys, clientKeys, nodeInfos, _, nodeCfgPaths := setupTestEnvironment(t, nodeNames, 0)
 
-	resNode2 := startTestDaemon(t, node2CfgPath, node2Name)
-	t.Cleanup(func() { stopTestDaemon(t, node2Name, resNode2) })
+	// Start Daemons
+	runningNodes := startDaemons(t, nodeInfos, nodeCfgPaths)
+	// Cleanup handled by t.Cleanup in startDaemons
 
-	// --- Wait for Daemons ---
-	t.Log("Waiting for daemons to start...")
-	waitForDaemon(t, node1Endpoint, 30*time.Second)
-	waitForDaemon(t, node2Endpoint, 30*time.Second)
-	// Increase sleep slightly to ensure peers likely connect and initial sync attempt happens
-	time.Sleep(pollInterval + 1*time.Second)
-	t.Log("Daemons appear ready.")
+	// Wait for Daemons
+	waitForDaemons(t, runningNodes, nodeInfos, 30*time.Second) // Pass nodeInfos
 
-	// --- Execute Push ---
+	// Execute Push (2 parts, threshold 2)
+	readers := []string{node1Name, node2Name, clientName}
 	// Use node1's config for push, it contains peer info for node2.
-	runPushCommand(t, masterKeys.PrivatePath, node1CfgPath)
+	runPushCommand(t, masterKeys.PrivatePath, nodeCfgPaths[node1Name], 2, 2, readers, testSecretKey, testSecretVal)
 
 	// Allow time for synchronization
 	t.Logf("Waiting for sync (%s)...", pollInterval+1*time.Second)
 	time.Sleep(pollInterval + 1*time.Second) // Wait longer than poll interval
 
-	// --- Execute Get ---
-	outputFilePath := filepath.Join(absTmpDir, "retrieved_secret.txt")
+	// Execute Get
+	outputFilePath := filepath.Join(filepath.Dir(nodeCfgPaths[node1Name]), "retrieved_secret_2nodes.txt")
 	// Use node1's config for get, it contains peer info needed to find owner endpoints.
-	runGetCommand(t, clientKeys.PrivatePath, node1CfgPath, outputFilePath)
+	runGetCommand(t, clientName, clientKeys.PrivatePath, nodeCfgPaths[node1Name], testSecretKey, outputFilePath)
+
+	// Verify Secret
+	verifySecret(t, outputFilePath, testSecretVal)
+
+	t.Log("Two-node integration test finished.")
+}
+
+// TestPushAndGetIntegration_TwoOutOfThreeNodes tests retrieving a secret when one of three nodes is down.
+func TestPushAndGetIntegration_TwoOutOfThreeNodes(t *testing.T) {
+	t.Parallel()
+
+	nodeNames := []string{node1Name, node2Name, node3Name}
+	masterKeys, clientKeys, nodeInfos, _, nodeCfgPaths := setupTestEnvironment(t, nodeNames, 100)
+
+	// Start Daemons
+	runningNodes := startDaemons(t, nodeInfos, nodeCfgPaths)
+	// Cleanup handled by t.Cleanup in startDaemons
+
+	// Wait for Daemons
+	waitForDaemons(t, runningNodes, nodeInfos, 30*time.Second) // Pass nodeInfos
+
+	// Execute Push (3 parts, threshold 2)
+	readers := []string{node1Name, node2Name, node3Name, clientName}
+	// Use node1's config for push, it contains info for all peers.
+	runPushCommand(t, masterKeys.PrivatePath, nodeCfgPaths[node1Name], 3, 2, readers, testSecretKey, testSecretVal)
+
+	// Allow time for synchronization between the 3 nodes
+	t.Logf("Waiting for sync (%s)...", pollInterval+1*time.Second)
+	time.Sleep(pollInterval + 1*time.Second)
+
+	// --- Simulate Node Failure ---
+	t.Logf("Stopping node %s to simulate failure...", node3Name)
+	stopDaemon(t, runningNodes[node3Name])
+	// Remove node3 from runningNodes map to avoid waiting for it later if needed
+	delete(runningNodes, node3Name)
+	// Wait a moment to ensure the port is released/daemon is down
+	time.Sleep(1 * time.Second)
+	t.Logf("Node %s stopped.", node3Name)
+
+	// --- Execute Get (expecting success with 2 out of 3) ---
+	outputFilePath := filepath.Join(filepath.Dir(nodeCfgPaths[node1Name]), "retrieved_secret_2of3.txt")
+	// Use node1's config for get. It knows about all 3 original owners,
+	// but the 'get' command should only need to contact the available ones (node1, node2)
+	// to satisfy the threshold of 2.
+	runGetCommand(t, clientName, clientKeys.PrivatePath, nodeCfgPaths[node1Name], testSecretKey, outputFilePath)
 
 	// --- Verify Secret ---
-	retrievedBytes, err := os.ReadFile(outputFilePath)
-	assert.NilError(t, err, "Failed to read output file")
-	assert.Equal(t, string(retrievedBytes), testSecretVal, "Retrieved secret does not match original")
-	t.Log("Secret verification successful.")
+	verifySecret(t, outputFilePath, testSecretVal)
 
-	// Cleanup is handled by t.Cleanup calls
-	t.Log("Integration test finished.")
+	t.Log("Two-out-of-three nodes integration test finished.")
 }
