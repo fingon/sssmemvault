@@ -244,37 +244,23 @@ Use the `sssmemvault get` subcommand from an authorized reader machine (e.g., `c
 *   The `config.yaml` needs `peers` entries for at least the *owner* nodes (`node-A`, `node-B`) so the `get` command knows their endpoints and the nodes know the client's public key.
 
 ```bash
-# Example: Retrieve the "api-key" secret
+# Example: Retrieve the "api-key" secret and print it to standard output
 
 ./sssmemvault get \
   --client-name client-X \
   --private-key clientX_private.json \
   --config config.yaml \
-  --key "api-key" \
-  # --target node-a.example.com:59240 # Optional: Specify targets explicitly
-  # --target node-b.example.com:59240
-  --output api-key.txt \
-  --loglevel info
+  --key "api-key"
 
-# If successful, api-key.txt will contain "supersecret123"
-cat api-key.txt
+# To save the output to a file:
+# ./sssmemvault get ... > api-key.txt
 ```
 
 This command will:
-1. Load the client's combined private keyset (`clientX_private.json`), extracting the signer and decrypter.
-2. Load the config file (`config.yaml`) to find peer endpoints and public keys.
-3. Connect to the target nodes (derived from config or `--target`) and call `List` (authenticating with client name and signing key) to find the latest timestamp for `"api-key"`.
-4. Call `Get` on the node with the latest timestamp (authenticating again) to retrieve the full entry.
-5. Identify the owner **names** from the entry (`node-A`, `node-B`).
-6. Look up the endpoints for these owners by **name** in the loaded `config.yaml`.
-7. Connect to *each* owner node endpoint.
-8. Call `GetDecoded` on each owner node (authenticating with client name and signing key). Each owner node will:
-    a. Verify the client (`client-X`) is in the entry's `readers` list.
-    b. Decrypt its fragment(s) using its own *hybrid private key* (from its `private_key_path`).
-    c. Find the client's *public keyset* (`clientX_public.json`) using the client's name (`client-X`) in its `peers` config.
-    d. Extract the client's *hybrid public key* from the keyset.
-    e. Re-encrypt the fragment(s) using the client's *hybrid public key*.
-    f. Return the re-encrypted fragment(s).
-9. Decrypt each received fragment using the client's *hybrid private key* (extracted from `--private-key`).
-10. Combine the decrypted fragments using Shamir's algorithm (needs enough fragments to meet the threshold).
-11. Write the reconstructed secret to `api-key.txt`.
+1. Load the client's combined private keyset (`--private-key`) for authentication and decryption.
+2. Load the configuration (`--config`) to find the endpoints of the owner nodes.
+3. Contact the necessary owner nodes (derived from the config) to retrieve the latest version of the secret entry for the given key (`--key`).
+4. Request the encrypted fragments from the owner nodes, authenticating as the client (`--client-name`).
+5. Decrypt the received fragments using the client's private key.
+6. Combine the decrypted fragments to reconstruct the original secret.
+7. Print the reconstructed secret to standard output.
