@@ -1,5 +1,56 @@
 # sssmemvault #
 
+Disclaimer: This is pre-alpha code. This disclaimer will probably go
+away once all TODOs in the end of the README are done, and first
+release happens. This is mostly exercise in AI assisted coding as this
+isn't high priority enough for me to spend significant time on, but it
+is good testbench for 'let AI code, let me verify' model of work. (And
+yes, I need the tool, once it is done.)
+
+## Motivation ##
+
+I have some compute, and I also have lots of storage connected to
+it. In general I am not a fan of unencrypted storage, and the typical
+problem is - what to do when machine starts? I do not like the idea of
+e.g. USB keys as source of encryption credentials, as if machine is
+stolen with its key, the data is available to whoever stole
+it. Storing the keys on device itself feels weird too, TPM or not
+(there is too much stuff there for me to feel it is 'trusted'). So..
+
+### The goals ###
+
+- (sufficient number of) other weakly trusted nodes on same network
+  enable use of local encrypted storage on each node
+
+- if node can fetch keys using help of its peers, it is 'fine'
+
+- the encryption storage keys are only stored in memory
+
+=> If whole cluster suffers power outage, manual intervention is
+needed. (but this is probably rare, as opposed to maintenance or
+single node replacement)
+
+### Non-goals ###
+
+Prevent sophisticated attacker with physical access from getting to
+the data. There are plenty of attacks that are relatively hard to
+protect against, but I feel them to be unlikely for me
+personally. Those can happen any time, by e.g.
+
+1. starting headless machine as root from external storage (if
+   allowed) or mounting their local storage in different device (hard
+   to protect against),
+
+2. doing bad things to root filesystem, and
+
+3. enjoying once the machine is started by me after perceived outage.
+
+Prevent sophisticated attacker with root access to the node from
+getting data. If this happens, you can anyway get encryption keys from
+memory so this is not something worth protecting against.
+
+## So, what is sssmemvault? ##
+
 This is Shamir's Secret Sharing based in-memory secret vault, which is
 planned to be used in networks with more than one static node that act
 as gatekeepers to the secrets.
@@ -264,3 +315,13 @@ This command will:
 5. Decrypt the received fragments using the client's private key.
 6. Combine the decrypted fragments to reconstruct the original secret.
 7. Print the reconstructed secret to standard output.
+
+# TODO #
+
+- In daemon mode, add detach option which leaves server running in Background. Also make the server check configuration file periodically for changes, and reload if changes have happened.
+
+- As availability of nodes may change over time, change the daemon and synchronizer to connect peers only on demand as their availability may change over time.
+
+- Add support for configurable number of fragments per each owner, default to 1.
+
+- Make first release once all known TODOs are done
