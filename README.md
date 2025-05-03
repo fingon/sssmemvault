@@ -130,6 +130,10 @@ The `sssmemvault` tool has four subcommands:
 
 *   `genkeys`: Generates combined private and public keyset files for a node or client.
 *   `daemon`: Runs the sssmemvault daemon node.
+    *   `--detach` / `-d`: Runs the daemon in the background. Requires `--pidfile` and `--logfile`.
+    *   `--pidfile`: Path to the PID file (used with `--detach`). Default: `/var/run/sssmemvaultd.pid`. Can be set via `SSSMEMVAULT_PIDFILE` env var.
+    *   `--logfile`: Path to the log file (used with `--detach`). Default: `/var/log/sssmemvaultd.log`. Can be set via `SSSMEMVAULT_LOGFILE` env var.
+    *   `--config-check-interval`: How often to check the config file for changes (e.g., `60s`, `5m`). If changes are detected (based on modification time and content hash), the daemon gracefully restarts its services with the new configuration. Set to `0s` to disable automatic checking. Default: `1m`. Reload can also be triggered manually by sending `SIGHUP` to the daemon process.
 *   `push`: Creates and pushes a new secret entry to nodes (owners and fragment distribution derived from config).
 *   `get`: Retrieves and reconstructs a secret from nodes.
 
@@ -250,7 +254,20 @@ cp nodeB_private.json node_private.json
 ./sssmemvault daemon --config config.yaml --my-name node-B --loglevel debug
 ```
 
-The nodes will now start, load their respective combined private keysets, connect to peers defined in the config, listen for requests, and poll peers with `poll_interval`.
+The nodes will now start, load their respective combined private keysets, connect to peers defined in the config, listen for requests, poll peers with `poll_interval`, and automatically reload their configuration if the `config.yaml` file is modified (unless `--config-check-interval=0s` is used). You can also trigger a reload manually by sending a `SIGHUP` signal (e.g., `kill -HUP <pid>`).
+
+To run in the background (detached mode):
+
+```bash
+# Example for Node A
+./sssmemvault daemon \
+  --config config.yaml \
+  --my-name node-A \
+  --detach \
+  --pidfile /var/run/sssmemvaultd-nodeA.pid \
+  --logfile /var/log/sssmemvaultd-nodeA.log \
+  --loglevel info
+```
 
 **7. Provisioning a Secret (`sssmemvault push`)**
 
@@ -322,6 +339,6 @@ This command will:
 
 # TODO #
 
-- In daemon mode, add detach option which leaves server running in Background. Also make the server check configuration file periodically for changes, and reload if changes have happened.
-
 - Make first release once all known TODOs are done
+
+- Make sure this actually works for real (in my homelab)
