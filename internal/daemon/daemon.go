@@ -8,12 +8,10 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/fingon/sssmemvault/internal/config"
-	"github.com/fingon/sssmemvault/internal/node"
 	"github.com/fingon/sssmemvault/internal/server"
 	"github.com/fingon/sssmemvault/internal/store"
 	"github.com/fingon/sssmemvault/internal/synchronizer"
@@ -48,59 +46,6 @@ func initializeStore(appCfg *config.Config) (*store.InMemoryStore, error) {
 	}
 	slog.Info("In-memory store initialized")
 	return localStore, nil
-}
-
-// connectToPeers establishes connections to configured peers.
-// Returns the map of connected peers and a cleanup function to close connections.
-func connectToPeers(ctx context.Context, appCfg *config.Config, myName string) (map[string]*node.PeerNode, func()) {
-	peerNodes := make(map[string]*node.PeerNode)
-	var wgConnect sync.WaitGroup
-	var mu sync.Mutex // Protect peerNodes map
-
-	connectCtx, connectCancel := context.WithTimeout(ctx, 30*time.Second) // Timeout for initial connections
-	defer connectCancel()
-
-	for name, peerCfgPtr := range appCfg.LoadedPeers {
-		localName := name
-		localPeerCfgPtr := peerCfgPtr
-
-		if localName == myName {
-			slog.Debug("Skipping connection to self", "name", localName)
-			continue
-		}
-		if localPeerCfgPtr.Endpoint == "" {
-			slog.Debug("Skipping connection to peer without endpoint", "name", localName)
-			continue
-		}
-
-		wgConnect.Add(1)
-		go func() {
-			defer wgConnect.Done()
-			peerNode, err := node.ConnectToPeer(connectCtx, localName, localPeerCfgPtr)
-			if err == nil {
-				mu.Lock()
-				peerNodes[localName] = peerNode
-				mu.Unlock()
-			}
-			// Error logging happens within ConnectToPeer/DialPeer
-		}()
-	}
-	wgConnect.Wait()
-
-	cleanup := func() {
-		slog.Info("Closing peer connections...")
-		for name, pn := range peerNodes {
-			if pn != nil {
-				err := pn.Close()
-				if err != nil {
-					slog.Warn("Error closing connection to peer", "peer_name", name, "err", err)
-				}
-			}
-		}
-	}
-
-	slog.Info("Attempted connections to all configured peers", "connected_count", len(peerNodes), "config_count", len(appCfg.Peers))
-	return peerNodes, cleanup
 }
 
 // setupGRPCServer configures and creates the gRPC server instance and listener.
@@ -206,10 +151,7 @@ func Run(daemonCfg *Config) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // Ensure context is cancelled on exit
 
-	peerNodes, cleanupPeers := connectToPeers(ctx, appCfg, daemonCfg.MyName)
-	defer cleanupPeers() // Ensure connections are closed on exit
-
-	syncr, err := synchronizer.NewSynchronizer(appCfg, localStore, peerNodes, daemonCfg.MyName)
+	syncr, err := synchronizer.NewSynchronizer(appCfg, localStore, daemonCfg.MyName)
 	if err != nil {
 		slog.Error("Initialization failed", "step", "initialize synchronizer", "err", err)
 		return 1

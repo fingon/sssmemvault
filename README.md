@@ -324,6 +324,4 @@ This command will:
 
 - In daemon mode, add detach option which leaves server running in Background. Also make the server check configuration file periodically for changes, and reload if changes have happened.
 
-- As availability of nodes may change over time, change the daemon and synchronizer to connect peers only on demand as their availability may change over time.
-
 - Make first release once all known TODOs are done

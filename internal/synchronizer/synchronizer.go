@@ -17,22 +17,21 @@ import (
 
 // Synchronizer handles polling peer nodes and updating the local store.
 type Synchronizer struct {
-	cfg         *config.Config
+	cfg         *config.Config // Holds all peer configs
 	localStore  *store.InMemoryStore
-	peerNodes   map[string]*node.PeerNode // Map: Peer Name -> PeerNode client
-	selfName    string                    // Name of the node running this synchronizer
+	selfName    string // Name of the node running this synchronizer
 	selfPrivKey tink.Signer
 	stopChan    chan struct{}
 	wg          sync.WaitGroup
 }
 
 // NewSynchronizer creates a new Synchronizer instance.
-func NewSynchronizer(cfg *config.Config, s *store.InMemoryStore, peers map[string]*node.PeerNode, selfName string) (*Synchronizer, error) {
-	if cfg == nil || s == nil || peers == nil {
-		return nil, errors.New("config, store, and peer nodes cannot be nil")
+func NewSynchronizer(cfg *config.Config, s *store.InMemoryStore, selfName string) (*Synchronizer, error) {
+	if cfg == nil || s == nil {
+		return nil, errors.New("config and store cannot be nil")
 	}
 	if cfg.PrivKeySigner == nil {
-		return nil, errors.New("config is missing private key signer")
+		return nil, errors.New("config is missing private key signer") // Signer needed for authenticated calls
 	}
 	if selfName == "" {
 		return nil, errors.New("selfName cannot be empty")
@@ -40,23 +39,27 @@ func NewSynchronizer(cfg *config.Config, s *store.InMemoryStore, peers map[strin
 	return &Synchronizer{
 		cfg:         cfg,
 		localStore:  s,
-		peerNodes:   peers,
 		selfName:    selfName,
 		selfPrivKey: cfg.PrivKeySigner,
 		stopChan:    make(chan struct{}),
 	}, nil
 }
 
-// Start initiates the background polling goroutines for eligible peers.
+// Start initiates the background polling goroutines for eligible peers defined in the config.
 func (self *Synchronizer) Start(ctx context.Context) {
 	slog.Info("Starting synchronizer...", "self_name", self.selfName)
-	for name, peerNode := range self.peerNodes {
-		// Check if this peer is configured for polling
-		if peerNode.Config != nil && peerNode.Config.PollInterval != nil && *peerNode.Config.PollInterval > 0 {
-			self.wg.Add(1)
-			go self.pollPeerLoop(ctx, name, peerNode, *peerNode.Config.PollInterval)
-		} else {
+	// Iterate through peers defined in the configuration
+	for name, peerCfg := range self.cfg.LoadedPeers {
+		switch {
+		case name == self.selfName:
+			slog.Debug("Skipping polling loop for self", "peer_name", name)
+		case peerCfg == nil || peerCfg.PollInterval == nil || *peerCfg.PollInterval <= 0:
 			slog.Info("Peer not configured for polling or interval is zero, skipping", "peer_name", name)
+		default:
+			// Peer is not self and is configured for polling
+			self.wg.Add(1)
+			// Pass peer name and config to the loop
+			go self.pollPeerLoop(ctx, name, peerCfg, *peerCfg.PollInterval)
 		}
 	}
 	slog.Info("Synchronizer started")
@@ -70,20 +73,20 @@ func (self *Synchronizer) Stop() {
 	slog.Info("Synchronizer stopped")
 }
 
-// pollPeerLoop is the main loop for polling a single peer.
-func (self *Synchronizer) pollPeerLoop(ctx context.Context, peerName string, peerNode *node.PeerNode, interval time.Duration) {
+// pollPeerLoop is the main loop for polling a single peer, using its configuration.
+func (self *Synchronizer) pollPeerLoop(ctx context.Context, peerName string, peerCfg *config.PeerConfig, interval time.Duration) {
 	defer self.wg.Done()
 	slog.Info("Starting polling loop for peer", "peer_name", peerName, "interval", interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Initial poll immediately before starting the ticker loop
-	self.syncWithPeer(ctx, peerName, peerNode)
+	self.syncWithPeer(ctx, peerName, peerCfg)
 
 	for {
 		select {
 		case <-ticker.C:
-			self.syncWithPeer(ctx, peerName, peerNode)
+			self.syncWithPeer(ctx, peerName, peerCfg)
 		case <-self.stopChan:
 			slog.Info("Stopping polling loop for peer", "peer_name", peerName)
 			return
@@ -94,9 +97,13 @@ func (self *Synchronizer) pollPeerLoop(ctx context.Context, peerName string, pee
 	}
 }
 
-// getRemoteEntries fetches the list of entry metadata from a peer.
+// getRemoteEntries fetches the list of entry metadata from a connected peer node.
 func (self *Synchronizer) getRemoteEntries(ctx context.Context, peerName string, peerNode *node.PeerNode) ([]*pb.EntryMetadata, error) {
-	remoteListResp, err := peerNode.CallList(ctx, self.selfName, self.selfPrivKey)
+	// Use a shorter timeout for the specific RPC call
+	callCtx, callCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer callCancel()
+
+	remoteListResp, err := peerNode.CallList(callCtx, self.selfName, self.selfPrivKey)
 	if err != nil {
 		slog.Warn("Failed to get entry list from peer during sync", "peer_name", peerName, "err", err)
 		return nil, err // Return error to caller
@@ -130,14 +137,19 @@ func shouldFetchEntry(remoteMeta *pb.EntryMetadata, localEntryMap map[string]*ti
 	return false
 }
 
-// fetchAndUpdateEntry fetches a specific entry from a peer and updates the local store.
+// fetchAndUpdateEntry fetches a specific entry from a connected peer node and updates the local store.
 func (self *Synchronizer) fetchAndUpdateEntry(ctx context.Context, peerName string, peerNode *node.PeerNode, remoteMeta *pb.EntryMetadata) (updated bool, err error) {
 	getRequest := &pb.GetRequest{
 		Key:       remoteMeta.Key,
 		Timestamp: remoteMeta.Timestamp,
 	}
+
+	// Use a shorter timeout for the specific RPC call
+	callCtx, callCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer callCancel()
+
 	// Authenticate Get call using selfName
-	getResponse, err := peerNode.CallGet(ctx, self.selfName, self.selfPrivKey, getRequest)
+	getResponse, err := peerNode.CallGet(callCtx, self.selfName, self.selfPrivKey, getRequest)
 	if err != nil {
 		slog.Warn("Failed to get entry details from peer during sync",
 			"peer_name", peerName,
@@ -173,11 +185,28 @@ func (self *Synchronizer) fetchAndUpdateEntry(ctx context.Context, peerName stri
 	return updated, nil
 }
 
-// syncWithPeer performs a single synchronization cycle with a given peer.
-func (self *Synchronizer) syncWithPeer(ctx context.Context, peerName string, peerNode *node.PeerNode) {
-	slog.Debug("Starting sync cycle with peer", "peer_name", peerName)
+// syncWithPeer performs a single synchronization cycle with a given peer using its config.
+// It connects, syncs, and disconnects.
+func (self *Synchronizer) syncWithPeer(ctx context.Context, peerName string, peerCfg *config.PeerConfig) {
+	slog.Debug("Starting sync cycle with peer", "peer_name", peerName, "endpoint", peerCfg.Endpoint)
 
-	// 1. Get remote list
+	// Use a timeout for the connection attempt for this cycle
+	connectCtx, connectCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer connectCancel()
+
+	// 1. Connect to peer for this cycle
+	peerNode, err := node.ConnectToPeer(connectCtx, peerName, peerCfg)
+	if err != nil {
+		slog.Warn("Failed to connect to peer for sync cycle", "peer_name", peerName, "endpoint", peerCfg.Endpoint, "err", err)
+		return // Cannot sync if connection fails
+	}
+	defer func() {
+		if err := peerNode.Close(); err != nil {
+			slog.Warn("Error closing connection after sync cycle", "peer_name", peerName, "err", err)
+		}
+	}()
+
+	// 2. Get remote list using the established connection
 	remoteEntries, err := self.getRemoteEntries(ctx, peerName, peerNode)
 	if err != nil {
 		return // Error already logged
