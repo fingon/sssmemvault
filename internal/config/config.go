@@ -23,6 +23,8 @@ type PeerConfig struct {
 	Endpoint      string         `yaml:"endpoint"`                // e.g., "node1.example.com:59240" or "192.168.1.101:59240"
 	PublicKeyPath string         `yaml:"public_key_path"`         // Path to peer's combined public keyset file (signing + hybrid)
 	PollInterval  *time.Duration `yaml:"poll_interval,omitempty"` // Optional polling frequency (Go duration string)
+	// FragmentsPerOwner specifies how many SSS fragments this peer should own for secrets it's an owner of. Defaults to 1.
+	FragmentsPerOwner int `yaml:"fragments_per_owner,omitempty"`
 
 	// Internal fields populated after loading
 	PubKeyVerifier  tink.Verifier      `yaml:"-"` // Tink public key verifier (from public_key_path)
@@ -103,6 +105,11 @@ func loadConfigInternal(path string, ignoreOwnKeyErrors bool) (*Config, error) {
 		}
 		if peerCfg.Endpoint == "" {
 			slog.Debug("Peer config has empty endpoint, assuming client-only entry", "peer_name", name)
+		}
+		// Set default FragmentsPerOwner if not specified
+		if peerCfg.FragmentsPerOwner <= 0 {
+			peerCfg.FragmentsPerOwner = 1
+			slog.Debug("Setting default fragments_per_owner=1 for peer", "peer_name", name)
 		}
 
 		// Load Public Key Verifier

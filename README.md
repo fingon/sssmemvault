@@ -99,6 +99,7 @@ timestamp wins.
   - `endpoint`: GRPC endpoint (host:port)
   - `public_key_path`: Path to the peer's combined *public* keyset file (containing signing and hybrid public keys). Used for verifying their requests and encrypting data *for* them.
   - `poll_interval` (optional): Go duration string (e.g., `60s`), indicating this peer should be polled for updates.
+  - `fragments_per_owner` (optional, integer): Number of SSS fragments this peer should own for secrets it's an owner of. Defaults to `1` if omitted or <= 0.
 
 ## Requests ##
 
@@ -129,7 +130,7 @@ The `sssmemvault` tool has four subcommands:
 
 *   `genkeys`: Generates combined private and public keyset files for a node or client.
 *   `daemon`: Runs the sssmemvault daemon node.
-*   `push`: Creates and pushes a new secret entry to nodes (owners derived from config).
+*   `push`: Creates and pushes a new secret entry to nodes (owners and fragment distribution derived from config).
 *   `get`: Retrieves and reconstructs a secret from nodes.
 
 Use `sssmemvault <command> --help` for details on each subcommand's flags.
@@ -210,9 +211,11 @@ peers:
     endpoint: "node-b.example.com:59240" # Or IP:port "192.168.42.34:59240"
     public_key_path: "nodeB_public.json" # Path to Node B's combined public keyset
     poll_interval: "60s" # Poll Node B every 60 seconds
+    # fragments_per_owner: 1 # Explicitly setting the default
 
   # Configuration for the Client (used by Node A & B daemons for auth verification and GetDecoded encryption)
   # The client itself doesn't run a daemon, but nodes need its public keyset info.
+  # fragments_per_owner is not relevant here as clients don't own fragments.
   "client-X":
     endpoint: "" # Endpoint not needed as client doesn't listen
     public_key_path: "clientX_public.json" # Path to Client X's combined public keyset
@@ -256,7 +259,8 @@ Use the `sssmemvault push` subcommand. This requires the *master signing private
 ```bash
 # Example: Push a secret named "api-key" with value "supersecret123"
 # Owned by Node A and Node B (derived from config).
-# Split into 2 fragments (must match number of owners in config), requiring 2 to reconstruct.
+# Total fragments = fragments_per_owner[node-A] + fragments_per_owner[node-B] (default 1+1=2).
+# Threshold = 2 (requires both fragments).
 # Readable by Node A, Node B, and the client client-X.
 # Targets are derived from config unless specified with --target.
 
@@ -268,7 +272,6 @@ Use the `sssmemvault push` subcommand. This requires the *master signing private
   --reader client-X \
   --key "api-key" \
   --secret "supersecret123" \
-  --parts 2 \
   --threshold 2 \
   --loglevel info
 ```
@@ -276,11 +279,12 @@ Use the `sssmemvault push` subcommand. This requires the *master signing private
 This command will:
 1. Load the master signing private key.
 2. Load the config file.
-3. Identify owner peers (nodes with public keys listed in `peers`).
-4. Validate that `--parts` matches the number of identified owner peers.
-5. Split the secret into fragments based on `--parts` and `--threshold`.
-6. Encrypt each fragment using the corresponding owner's *hybrid public key* (extracted from their `public_key_path` in the config).
-7. Create the protobuf `Entry`, storing the encrypted fragments associated with each owner **name**. Include reader **names**.
+3. Identify owner peers (nodes with public keys and endpoints listed in `peers`).
+4. Calculate the total number of fragments needed by summing `fragments_per_owner` for each owner peer (defaulting to 1 if not specified).
+5. Validate that `--threshold` is not greater than the total number of fragments.
+6. Split the secret into the calculated total number of fragments using the specified `--threshold`.
+7. Distribute and encrypt the fragments: assign `fragments_per_owner` fragments to each owner, encrypting them using the owner's *hybrid public key* (from their `public_key_path` in the config).
+8. Create the protobuf `Entry`, storing the encrypted fragments associated with each owner **name**. Include reader **names**.
 8. Sign the entry using the master signing private key.
 9. Connect to the target nodes (derived from config or specified via `--target`) and call the `Push` RPC.
 
@@ -321,7 +325,5 @@ This command will:
 - In daemon mode, add detach option which leaves server running in Background. Also make the server check configuration file periodically for changes, and reload if changes have happened.
 
 - As availability of nodes may change over time, change the daemon and synchronizer to connect peers only on demand as their availability may change over time.
-
-- Add support for configurable number of fragments per each owner, default to 1.
 
 - Make first release once all known TODOs are done

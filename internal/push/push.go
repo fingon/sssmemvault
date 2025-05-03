@@ -23,9 +23,9 @@ type Config struct {
 	Key                  string   `kong:"name='key',required,help='The key name for the secret.'"`
 	Secret               string   `kong:"name='secret',required,help='The secret value to store.'"`
 	Threshold            int      `kong:"name='threshold',short='t',required,help='Shamir threshold (number of fragments needed to reconstruct).'"`
-	Parts                int      `kong:"name='parts',short='p',required,help='Total number of Shamir fragments to create (must match number of peers in config).'"`
-	Targets              []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
-	ConfigPath           string   `kong:"name='config',required,help='Path to a configuration file to load parameters from (peers, targets).'"`
+	// Parts is now calculated based on sum of fragments_per_owner in config for owner peers.
+	Targets    []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
+	ConfigPath string   `kong:"name='config',required,help='Path to a configuration file to load parameters from (peers, targets).'"`
 	// LogLevel is handled globally
 }
 
@@ -64,35 +64,44 @@ func loadConfigAndDeriveTargets(pushCfg *Config) (*config.Config, error) {
 	return appCfg, nil
 }
 
-// prepareFragments splits the secret and encrypts fragments for each owner peer defined in the config.
-func prepareFragments(secret string, parts, threshold int, appCfg *config.Config) (map[string]*pb.FragmentList, error) {
+// prepareFragments splits the secret and encrypts fragments for each owner peer defined in the config,
+// respecting the FragmentsPerOwner setting for each peer.
+func prepareFragments(secret string, threshold int, appCfg *config.Config) (map[string]*pb.FragmentList, error) {
 	// Identify owner peers (those with loaded encrypters AND endpoints in the config)
+	// and calculate total parts needed.
 	ownerPeers := make(map[string]*config.PeerConfig)
+	totalParts := 0
 	for name, peerCfg := range appCfg.LoadedPeers {
 		// An owner must have an encrypter AND an endpoint to receive the push.
 		if peerCfg.PubKeyEncrypter != nil && peerCfg.Endpoint != "" {
 			ownerPeers[name] = peerCfg
+			totalParts += peerCfg.FragmentsPerOwner
+			slog.Debug("Identified owner peer", "name", name, "fragments_per_owner", peerCfg.FragmentsPerOwner)
 		} else {
 			slog.Debug("Peer does not qualify as an owner (missing encrypter or endpoint)", "peer_name", name, "has_encrypter", peerCfg.PubKeyEncrypter != nil, "has_endpoint", peerCfg.Endpoint != "")
 		}
 	}
 	numOwners := len(ownerPeers)
 	if numOwners == 0 {
-		return nil, errors.New("no owner peers found in configuration (peers with public keys)")
+		return nil, errors.New("no owner peers found in configuration (peers with public keys and endpoints)")
 	}
-	if parts != numOwners {
-		return nil, fmt.Errorf("number of parts (%d) must match the number of owner peers defined in the config file (%d)", parts, numOwners)
+	if totalParts == 0 {
+		// Should not happen if numOwners > 0 and default is 1, but check defensively
+		return nil, errors.New("calculated total parts is zero, check fragments_per_owner in config")
 	}
-	slog.Info("Identified owner peers from config", "count", numOwners, "names", ownerPeers) // Consider logging names if not too many
+	if threshold > totalParts {
+		return nil, fmt.Errorf("threshold (%d) cannot be greater than the total number of fragments (%d) calculated from owner peers", threshold, totalParts)
+	}
+	slog.Info("Identified owner peers from config", "count", numOwners, "total_fragments", totalParts, "names", ownerPeers) // Consider logging names if not too many
 
-	slog.Debug("Splitting secret", "parts", parts, "threshold", threshold)
-	fragments, err := crypto.SplitSecret([]byte(secret), parts, threshold)
+	slog.Debug("Splitting secret", "total_parts", totalParts, "threshold", threshold)
+	fragments, err := crypto.SplitSecret([]byte(secret), totalParts, threshold)
 	if err != nil {
 		return nil, fmt.Errorf("failed to split secret: %w", err)
 	}
 	slog.Info("Secret split into fragments", "count", len(fragments))
 
-	// Encrypt Fragments and distribute round-robin
+	// Encrypt Fragments and distribute according to FragmentsPerOwner
 	ownerEncryptedFragments := make(map[string]*pb.FragmentList)
 	fragmentIndex := 0
 	for ownerName, ownerCfg := range ownerPeers {
@@ -101,32 +110,34 @@ func prepareFragments(secret string, parts, threshold int, appCfg *config.Config
 			return nil, fmt.Errorf("internal error: missing encrypter for owner %q", ownerName)
 		}
 		encrypter := ownerCfg.PubKeyEncrypter
+		numFragsForOwner := ownerCfg.FragmentsPerOwner
 
-		// Assign one fragment per owner in this simplified round-robin distribution
-		if fragmentIndex >= len(fragments) {
-			return nil, fmt.Errorf("internal error: Not enough fragments generated for distribution (needed %d, generated %d)", parts, len(fragments))
-		}
-		fragment := fragments[fragmentIndex]
+		slog.Debug("Assigning fragments to owner", "owner_name", ownerName, "count", numFragsForOwner)
+		ownerList := &pb.FragmentList{Fragments: make([][]byte, 0, numFragsForOwner)}
 
-		slog.Debug("Encrypting fragment for owner", "fragment_index", fragmentIndex, "owner_name", ownerName)
-		encrypted, err := crypto.EncryptFragment(encrypter, fragment)
-		if err != nil {
-			return nil, fmt.Errorf("failed to encrypt fragment %d for owner %q (%s): %w",
-				fragmentIndex, ownerName, ownerCfg.PublicKeyPath, err)
-		}
+		for range numFragsForOwner {
+			if fragmentIndex >= len(fragments) {
+				return nil, fmt.Errorf("internal error: not enough fragments generated for distribution (needed %d, generated %d)", totalParts, len(fragments))
+			}
+			fragment := fragments[fragmentIndex]
+			currentFragIndex := fragmentIndex // Capture for logging
 
-		// Initialize list if needed and append
-		if _, ok := ownerEncryptedFragments[ownerName]; !ok {
-			ownerEncryptedFragments[ownerName] = &pb.FragmentList{Fragments: make([][]byte, 0, 1)} // Expecting 1 fragment per owner now
+			slog.Debug("Encrypting fragment for owner", "fragment_index", currentFragIndex, "owner_name", ownerName)
+			encrypted, err := crypto.EncryptFragment(encrypter, fragment)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt fragment %d for owner %q (%s): %w",
+					currentFragIndex, ownerName, ownerCfg.PublicKeyPath, err)
+			}
+			ownerList.Fragments = append(ownerList.Fragments, encrypted)
+			fragmentIndex++
 		}
-		ownerEncryptedFragments[ownerName].Fragments = append(ownerEncryptedFragments[ownerName].Fragments, encrypted)
-		slog.Debug("Appended encrypted fragment to owner's list", "fragment_index", fragmentIndex, "owner_name", ownerName, "list_size_now", len(ownerEncryptedFragments[ownerName].Fragments))
-		fragmentIndex++
+		ownerEncryptedFragments[ownerName] = ownerList
+		slog.Debug("Finished assigning fragments to owner", "owner_name", ownerName, "assigned_count", len(ownerList.Fragments))
 	}
 
 	// Sanity check: ensure all fragments were assigned
 	if fragmentIndex != len(fragments) {
-		return nil, fmt.Errorf("internal error: Fragment count mismatch after distribution (assigned %d, total %d)", fragmentIndex, len(fragments))
+		return nil, fmt.Errorf("internal error: fragment count mismatch after distribution (assigned %d, total %d)", fragmentIndex, len(fragments))
 	}
 	slog.Info("Finished encrypting and distributing fragments")
 	return ownerEncryptedFragments, nil
@@ -221,16 +232,7 @@ func Run(pushCfg *Config) int {
 	}
 
 	// --- Validate Inputs (Post-Config Load/Derivation) ---
-	// Parts validation happens implicitly in prepareFragments now
-	if pushCfg.Parts <= 0 {
-		slog.Error("Number of parts must be positive", "parts", pushCfg.Parts)
-		return 1
-	}
-	// Threshold validation remains
-	if pushCfg.Threshold > pushCfg.Parts {
-		slog.Error("Threshold cannot be greater than the number of parts", "threshold", pushCfg.Threshold, "parts", pushCfg.Parts)
-		return 1
-	}
+	// Threshold validation remains (checked against calculated total parts in prepareFragments)
 	if pushCfg.Threshold <= 0 {
 		slog.Error("Threshold must be positive", "threshold", pushCfg.Threshold)
 		return 1
@@ -255,8 +257,8 @@ func Run(pushCfg *Config) int {
 	slog.Info("Loaded master private key (signer) successfully")
 
 	// --- Split Secret and Encrypt Fragments ---
-	// Owners and their keys are derived directly from appCfg
-	ownerEncryptedFragments, err := prepareFragments(pushCfg.Secret, pushCfg.Parts, pushCfg.Threshold, appCfg)
+	// Owners, their keys, and fragment counts are derived directly from appCfg
+	ownerEncryptedFragments, err := prepareFragments(pushCfg.Secret, pushCfg.Threshold, appCfg)
 	if err != nil {
 		slog.Error("Failed to prepare fragments", "err", err)
 		return 1

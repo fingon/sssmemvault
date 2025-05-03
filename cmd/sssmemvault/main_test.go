@@ -161,6 +161,10 @@ func createNodeConfig(t *testing.T, dir string, node peerInfo, nodePrivKeyPath, 
 		} else {
 			peerCfg.PollInterval = nil
 		}
+		// Set default fragments per owner for test config
+		if peerCfg.FragmentsPerOwner <= 0 {
+			peerCfg.FragmentsPerOwner = 1
+		}
 		peerConfigs[p.Name] = peerCfg
 	}
 
@@ -359,18 +363,17 @@ func waitForDaemons(t *testing.T, nodes map[string]*testNode, nodeInfos map[stri
 	t.Log("All specified daemons appear ready.")
 }
 
-// runPushCommand executes the push command.
-func runPushCommand(t *testing.T, masterPrivKeyPath, configPath string, parts, threshold int, readers []string, secretKey, secretValue string) {
+// runPushCommand executes the push command. Parts are now derived from config.
+func runPushCommand(t *testing.T, masterPrivKeyPath, configPath string, threshold int, readers []string, secretKey, secretValue string) {
 	t.Helper()
-	t.Logf("Pushing secret '%s' (parts=%d, threshold=%d)...", secretKey, parts, threshold)
+	t.Logf("Pushing secret '%s' (threshold=%d)...", secretKey, threshold)
 
 	args := []string{
 		"run", ".", "push",
 		"--master-private-key", masterPrivKeyPath,
-		"--config", configPath, // Config provides owner/target info
+		"--config", configPath, // Config provides owner/target info and fragment counts
 		"--key", secretKey,
 		"--secret", secretValue,
-		"--parts", strconv.Itoa(parts),
 		"--threshold", strconv.Itoa(threshold),
 		"--loglevel", "info",
 	}
@@ -432,7 +435,8 @@ func TestPushAndGetIntegration_TwoNodes(t *testing.T) {
 	// Execute Push (2 parts, threshold 2)
 	readers := []string{node1Name, node2Name, clientName}
 	// Use node1's config for push, it contains peer info for node2.
-	runPushCommand(t, masterKeys.PrivatePath, nodeCfgPaths[node1Name], 2, 2, readers, testSecretKey, testSecretVal)
+	// Parts (2) is derived from config (1 fragment per owner node). Threshold is 2.
+	runPushCommand(t, masterKeys.PrivatePath, nodeCfgPaths[node1Name], 2, readers, testSecretKey, testSecretVal)
 
 	// Allow time for synchronization
 	t.Logf("Waiting for sync (%s)...", pollInterval+1*time.Second)
@@ -466,7 +470,8 @@ func TestPushAndGetIntegration_TwoOutOfThreeNodes(t *testing.T) {
 	// Execute Push (3 parts, threshold 2)
 	readers := []string{node1Name, node2Name, node3Name, clientName}
 	// Use node1's config for push, it contains info for all peers.
-	runPushCommand(t, masterKeys.PrivatePath, nodeCfgPaths[node1Name], 3, 2, readers, testSecretKey, testSecretVal)
+	// Parts (3) is derived from config (1 fragment per owner node). Threshold is 2.
+	runPushCommand(t, masterKeys.PrivatePath, nodeCfgPaths[node1Name], 2, readers, testSecretKey, testSecretVal)
 
 	// Allow time for synchronization between the 3 nodes
 	t.Logf("Waiting for sync (%s)...", pollInterval+1*time.Second)
