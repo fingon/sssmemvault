@@ -8,11 +8,13 @@
 
     - use 'err' for errors
 
-- use latest Go version style
+- use latest Go version style and libraries
 
 - use latest Go conventions
 
   - use maps.Copy to copy map contents, and maps.Clone to make new copy
+
+  - use slices.Copy to copy slice contents, and slices.Clone to make new copy
 
   - use 'any' instead of 'interface{}'
 
@@ -24,7 +26,8 @@
 
 - if same value repeats multiple times in a code file, make it a constant
 
-- avoid writing comments about obvious actions, such as calling a function
+- do not write comments about obvious actions, such as calling a function
 
-- if there are complex code blocks within ifs, either create
-  sub-functions or prefer returning early
+- do not write comments about Go version specific behaviour
+
+- if there are complex code blocks within ifs, either create sub-functions or prefer returning early

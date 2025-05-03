@@ -54,7 +54,6 @@ func (self *InMemoryStore) AddOrUpdateEntry(entry *pb.Entry) (updated bool, err 
 	// Store if it doesn't exist or if the new entry's timestamp is strictly greater
 	if !exists || entry.Timestamp.AsTime().After(existingEntry.Timestamp.AsTime()) {
 		// Deep copy the entry before storing to avoid external modifications
-		// Note: proto.Clone is generally preferred for protobuf messages.
 		newEntry := proto.Clone(entry).(*pb.Entry)
 		self.entries[entry.Key] = newEntry
 		slog.Debug("Stored entry", "key", newEntry.Key, "timestamp", newEntry.Timestamp.AsTime(), "existed", exists)

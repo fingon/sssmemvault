@@ -134,13 +134,6 @@ func (self *SssMemVaultServer) Get(_ context.Context, req *pb.GetRequest) (*pb.G
 		return nil, status.Errorf(codes.NotFound, "Entry not found or timestamp mismatch for key %q: %v", req.Key, err)
 	}
 
-	// The store already verified the signature on add/update, but maybe verify again?
-	// err = crypto.VerifyEntrySignature(self.cfg.MasterPubKey, entry)
-	// if err != nil {
-	//  slog.Error("CRITICAL: Stored entry failed master signature verification!", "key", entry.Key, "err", err)
-	// 	return nil, status.Error(codes.Internal, "Stored entry signature invalid")
-	// }
-
 	resp := &pb.GetResponse{
 		Entry: entry, // Entry is already a clone from the store
 	}
@@ -165,7 +158,6 @@ func getRequestingNodeName(ctx context.Context) (string, error) {
 
 // authorizeReader checks if the requesting node is authorized to read the entry.
 func authorizeReader(entry *pb.Entry, requestingNodeName string) error {
-	// Requires Go 1.21+ for slices.Contains
 	if !slices.Contains(entry.Readers, requestingNodeName) {
 		slog.Warn("GetDecoded permission denied: requesting node not in readers list",
 			"key", entry.Key,
@@ -185,7 +177,7 @@ func (self *SssMemVaultServer) findAndDecryptOwnFragments(entry *pb.Entry) ([][]
 			"key", entry.Key,
 			"timestamp", entry.Timestamp.AsTime(),
 			"node_name", self.nodeName,
-			"owner_names", maps.Keys(entry.OwnerFragments)) // Requires Go 1.21+ for maps.Keys
+			"owner_names", maps.Keys(entry.OwnerFragments))
 		return nil, status.Errorf(codes.NotFound, "This node (%s) does not hold a fragment list for key %q", self.nodeName, entry.Key)
 	}
 	slog.Debug("GetDecoded: found encrypted fragment list for this node", "key", entry.Key, "node_name", self.nodeName, "fragment_count", len(fragmentList.Fragments))
