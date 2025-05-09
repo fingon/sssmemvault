@@ -22,6 +22,17 @@ import (
 	"google.golang.org/grpc"
 )
 
+// daemonState holds the active components of a running daemon instance.
+type daemonState struct {
+	appCfg     *config.Config
+	localStore *store.InMemoryStore
+	syncr      *synchronizer.Synchronizer
+	grpcServer *grpc.Server
+	lis        net.Listener
+	runCtx     context.Context    // Context for the current run cycle
+	runCancel  context.CancelFunc // Cancels the runCtx
+}
+
 const (
 	DefaultConfigCheckInterval = 1 * time.Minute
 	DefaultPidFile             = "/var/run/sssmemvaultd.pid" // Default PID file path
@@ -242,67 +253,78 @@ func calculateFileHash(filePath string) (string, error) {
 	return hex.EncodeToString(hash[:]), nil
 }
 
-// runCoreDaemonLogic sets up and runs the main daemon services within a loop for reloading.
-func runCoreDaemonLogic(daemonCfg *Config) int {
-	var appCfg *config.Config
-	var localStore *store.InMemoryStore
-	var syncr *synchronizer.Synchronizer
-	var grpcServer *grpc.Server
-	var lis net.Listener
+// initializeDaemonState loads configuration and initializes all daemon components.
+func initializeDaemonState(daemonCfg *Config) (*daemonState, error) {
+	slog.Info("Initializing daemon state...")
+	state := &daemonState{}
 	var err error
 
+	state.appCfg, err = loadDaemonConfig(daemonCfg.ConfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load daemon config: %w", err)
+	}
+
+	if state.appCfg.PrivKeySigner == nil || state.appCfg.PrivKeyDecrypter == nil {
+		return nil, fmt.Errorf("daemon requires both signing and decryption keys loaded from private_key_path %q", state.appCfg.PrivateKeyPath)
+	}
+
+	state.localStore, err = initializeStore(state.appCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize store: %w", err)
+	}
+
+	state.runCtx, state.runCancel = context.WithCancel(context.Background())
+
+	state.syncr, err = synchronizer.NewSynchronizer(state.appCfg, state.localStore, daemonCfg.MyName)
+	if err != nil {
+		state.runCancel() // Clean up context
+		return nil, fmt.Errorf("failed to initialize synchronizer: %w", err)
+	}
+
+	state.grpcServer, state.lis, err = setupGRPCServer(state.appCfg, state.localStore, daemonCfg.MyName)
+	if err != nil {
+		state.runCancel() // Clean up context
+		if state.lis != nil {
+			_ = state.lis.Close()
+		}
+		return nil, fmt.Errorf("failed to setup gRPC server: %w", err)
+	}
+
+	slog.Info("Daemon state initialized successfully.")
+	return state, nil
+}
+
+// startDaemonServices starts the gRPC server and synchronizer.
+func startDaemonServices(state *daemonState) (grpcErrChan chan error, syncDoneChan chan struct{}) {
+	slog.Info("Starting daemon services...")
+	grpcErrChan, syncDoneChan = startServices(state.runCtx, state.grpcServer, state.lis, state.syncr)
+	slog.Info("Daemon services (gRPC, Synchronizer) initiated.")
+	return
+}
+
+// stopDaemonServices stops all running services in the daemonState.
+func stopDaemonServices(state *daemonState, syncDoneChan chan struct{}) {
+	slog.Info("Stopping daemon services for current cycle...")
+	// Note: runCancel is called by the caller (runCoreDaemonLogic) which signals synchronizer via context.
+	// stopServices handles gRPC server stop and waits for syncDoneChan.
+	stopServices(state.grpcServer, state.runCancel, syncDoneChan)
+	slog.Info("Daemon services stopped.")
+}
+
+// runCoreDaemonLogic sets up and runs the main daemon services within a loop for reloading.
+func runCoreDaemonLogic(daemonCfg *Config) int {
 	// Main loop for handling reloads
 	for {
-		slog.Info("Loading configuration and initializing services...")
-		appCfg, err = loadDaemonConfig(daemonCfg.ConfigPath)
+		state, err := initializeDaemonState(daemonCfg)
 		if err != nil {
-			slog.Error("Initialization failed", "step", "load config", "err", err)
-			// If config fails to load on startup or reload, it's likely fatal.
-			return 1
+			slog.Error("Daemon initialization failed", "err", err)
+			return 1 // Fatal if initial setup fails
 		}
 
-		// Validate keys required for daemon operation
-		if appCfg.PrivKeySigner == nil || appCfg.PrivKeyDecrypter == nil {
-			slog.Error("Initialization failed: Daemon requires both signing and decryption keys loaded from private_key_path", "path", appCfg.PrivateKeyPath)
-			return 1
-		}
-
-		// Initialize store (re-initialize if reloading, using potentially new master key)
-		localStore, err = initializeStore(appCfg)
-		if err != nil {
-			slog.Error("Initialization failed", "step", "initialize store", "err", err)
-			return 1
-		}
-
-		// Create a context for this run cycle (cancelled on shutdown or reload)
-		runCtx, runCancel := context.WithCancel(context.Background())
-
-		// Initialize synchronizer (re-initialize if reloading)
-		syncr, err = synchronizer.NewSynchronizer(appCfg, localStore, daemonCfg.MyName)
-		if err != nil {
-			slog.Error("Initialization failed", "step", "initialize synchronizer", "err", err)
-			runCancel() // Clean up context
-			return 1
-		}
-
-		// Setup gRPC server (re-initialize if reloading)
-		grpcServer, lis, err = setupGRPCServer(appCfg, localStore, daemonCfg.MyName)
-		if err != nil {
-			slog.Error("Initialization failed", "step", "setup gRPC server", "err", err)
-			runCancel() // Clean up context
-			// Attempt to close listener if it was created
-			if lis != nil {
-				_ = lis.Close()
-			}
-			return 1
-		}
-
-		// Start services for this cycle
-		grpcErrChan, syncDoneChan := startServices(runCtx, grpcServer, lis, syncr)
+		grpcErrChan, syncDoneChan := startDaemonServices(state)
 
 		// Start config watcher for this cycle
-		// Use a separate context for the watcher that's also cancelled by runCancel
-		watcherCtx, watcherCancel := context.WithCancel(runCtx)
+		watcherCtx, watcherCancel := context.WithCancel(state.runCtx)
 		var watcherWg sync.WaitGroup
 		watcherWg.Add(1)
 		go func() {
@@ -339,20 +361,23 @@ func runCoreDaemonLogic(daemonCfg *Config) int {
 		case <-reloadSignal:
 			slog.Info("Internal reload signal received, initiating configuration reload...")
 			// Break inner select; loop will continue
-		case <-runCtx.Done():
+		case <-state.runCtx.Done():
 			// Should not happen unless explicitly cancelled elsewhere, but handle defensively
 			slog.Warn("Daemon run context cancelled unexpectedly")
 			keepRunning = false
 		}
 
 		// --- Cleanup for this cycle ---
-		slog.Info("Stopping services for current cycle...")
-		watcherCancel()                                   // Stop config watcher first
-		watcherWg.Wait()                                  // Wait for watcher goroutine to finish
-		stopServices(grpcServer, runCancel, syncDoneChan) // Stops gRPC, cancels context, waits for sync
+		slog.Info("Initiating cleanup for current daemon cycle...")
+		watcherCancel()  // Stop config watcher first
+		watcherWg.Wait() // Wait for watcher goroutine to finish
+
+		// stopDaemonServices will call state.runCancel(), which stops the synchronizer via context,
+		// and then it waits for syncDoneChan. It also stops the gRPC server.
+		stopDaemonServices(state, syncDoneChan)
 
 		if !keepRunning {
-			slog.Info("Exiting daemon loop.")
+			slog.Info("Exiting daemon main loop.")
 			return exitCode // Exit the main function and return
 		}
 

@@ -163,57 +163,69 @@ func (self *PeerNode) CallGetDecoded(ctx context.Context, selfName string, selfP
 
 // --- Client Call Helpers (Used directly by client commands like 'get' and by daemon wrappers) ---
 
-// CallListFromClient performs the List RPC call using a provided client interface.
-func CallListFromClient(ctx context.Context, client pb.SssMemVaultClient, clientName string, clientPrivKey tink.Signer, req *pb.ListRequest) (*pb.ListResponse, error) {
+// makeAuthenticatedClientCall is a generic helper to make authenticated gRPC calls.
+// It handles context creation, logging, and error wrapping.
+func makeAuthenticatedClientCall[ReqT, RespT any](
+	ctx context.Context,
+	slog *slog.Logger,
+	grpcClient pb.SssMemVaultClient,
+	clientName string,
+	clientPrivKey tink.Signer,
+	req ReqT,
+	callFunc func(ctx context.Context, c pb.SssMemVaultClient, in ReqT, opts ...grpc.CallOption) (RespT, error),
+	methodNameForLog string, // e.g., "List", "Get"
+) (RespT, error) {
+	var zero RespT // Zero value for the response type
+
 	authedCtx, err := createAuthenticatedContext(ctx, clientName, clientPrivKey)
 	if err != nil {
-		// Not including peer name here as it's less relevant for direct client calls
-		return nil, fmt.Errorf("failed to create authenticated context for List call: %w", err)
+		return zero, fmt.Errorf("failed to create authenticated context for %s call: %w", methodNameForLog, err)
 	}
 
-	slog.Debug("Calling List on remote node", "client_name", clientName)
-	resp, err := client.List(authedCtx, req)
+	slog = slog.With("client_name", clientName)
+	slog.Debug("Calling remote node", "method", methodNameForLog)
+
+	resp, err := callFunc(authedCtx, grpcClient, req)
 	if err != nil {
 		st, _ := status.FromError(err)
-		slog.Warn("List call failed", "err", err, "grpc_code", st.Code())
-		return nil, fmt.Errorf("List call failed: %w", err) // Wrap original error
+		slog.Warn(methodNameForLog+" call failed", "err", err, "grpc_code", st.Code())
+		return zero, fmt.Errorf("%s call failed: %w", methodNameForLog, err)
 	}
-	slog.Debug("List call successful", "entry_count", len(resp.Entries))
+
+	slog.Debug(methodNameForLog+" call successful", "response_type", fmt.Sprintf("%T", resp))
 	return resp, nil
+}
+
+// CallListFromClient performs the List RPC call using a provided client interface.
+func CallListFromClient(ctx context.Context, client pb.SssMemVaultClient, clientName string, clientPrivKey tink.Signer, req *pb.ListRequest) (*pb.ListResponse, error) {
+	slog := slog.Default()
+	return makeAuthenticatedClientCall(ctx, slog, client, clientName, clientPrivKey, req,
+		func(cCtx context.Context, c pb.SssMemVaultClient, in *pb.ListRequest, opts ...grpc.CallOption) (*pb.ListResponse, error) {
+			return c.List(cCtx, in, opts...)
+		},
+		"List",
+	)
 }
 
 // CallGetFromClient performs the Get RPC call using a provided client interface.
 func CallGetFromClient(ctx context.Context, client pb.SssMemVaultClient, clientName string, clientPrivKey tink.Signer, req *pb.GetRequest) (*pb.GetResponse, error) {
-	authedCtx, err := createAuthenticatedContext(ctx, clientName, clientPrivKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create authenticated context for Get call: %w", err)
-	}
-
-	slog.Debug("Calling Get on remote node", "client_name", clientName, "key", req.Key, "timestamp", req.Timestamp.AsTime())
-	resp, err := client.Get(authedCtx, req)
-	if err != nil {
-		st, _ := status.FromError(err)
-		slog.Warn("Get call failed", "key", req.Key, "timestamp", req.Timestamp.AsTime(), "err", err, "grpc_code", st.Code())
-		return nil, fmt.Errorf("Get call failed for key %s: %w", req.Key, err)
-	}
-	slog.Debug("Get call successful", "key", req.Key)
-	return resp, nil
+	slog := slog.With("key", req.Key, "timestamp", req.Timestamp.AsTime())
+	return makeAuthenticatedClientCall(ctx, slog, client, clientName, clientPrivKey, req,
+		func(cCtx context.Context, c pb.SssMemVaultClient, in *pb.GetRequest, opts ...grpc.CallOption) (*pb.GetResponse, error) {
+			return c.Get(cCtx, in, opts...)
+		},
+		"Get",
+	)
 }
 
 // CallGetDecodedFromClient performs the GetDecoded RPC call using a provided client interface.
 func CallGetDecodedFromClient(ctx context.Context, client pb.SssMemVaultClient, clientName string, clientPrivKey tink.Signer, req *pb.GetDecodedRequest) (*pb.GetDecodedResponse, error) {
-	authedCtx, err := createAuthenticatedContext(ctx, clientName, clientPrivKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create authenticated context for GetDecoded call: %w", err)
-	}
+	slog := slog.With("key", req.Key, "timestamp", req.Timestamp.AsTime())
 
-	slog.Debug("Calling GetDecoded on remote node", "client_name", clientName, "key", req.Key, "timestamp", req.Timestamp.AsTime())
-	resp, err := client.GetDecoded(authedCtx, req)
-	if err != nil {
-		st, _ := status.FromError(err)
-		slog.Warn("GetDecoded call failed", "key", req.Key, "timestamp", req.Timestamp.AsTime(), "err", err, "grpc_code", st.Code())
-		return nil, fmt.Errorf("GetDecoded call failed for key %s: %w", req.Key, err)
-	}
-	slog.Debug("GetDecoded call successful", "key", req.Key)
-	return resp, nil
+	return makeAuthenticatedClientCall(ctx, slog, client, clientName, clientPrivKey, req,
+		func(cCtx context.Context, c pb.SssMemVaultClient, in *pb.GetDecodedRequest, opts ...grpc.CallOption) (*pb.GetDecodedResponse, error) {
+			return c.GetDecoded(cCtx, in, opts...)
+		},
+		"GetDecoded",
+	)
 }

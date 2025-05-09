@@ -18,6 +18,7 @@ import (
 
 // Config holds the specific configuration needed for the push subcommand.
 type Config struct {
+	// LogLevel is handled globally
 	MasterPrivateKeyPath string   `kong:"name='master-private-key',required,help='Path to the master private key JSON file (signing only).'"`
 	Readers              []string `kong:"name='reader',required,help='Name of a node allowed to read the secret. Repeat for each reader.'"`
 	Key                  string   `kong:"name='key',required,help='The key name for the secret.'"`
@@ -26,19 +27,16 @@ type Config struct {
 	// Parts is now calculated based on sum of fragments_per_owner in config for owner peers.
 	Targets    []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
 	ConfigPath string   `kong:"name='config',required,help='Path to a configuration file to load parameters from (peers, targets).'"`
-	// LogLevel is handled globally
 }
 
-// loadConfigAndDeriveTargets loads the configuration file and derives targets if needed.
-// Owners are now implicitly defined by the peers in the config file.
-func loadConfigAndDeriveTargets(pushCfg *Config) (*config.Config, error) {
+// loadConfigAndValidateInput loads the application configuration, derives targets if not specified,
+// and validates essential input parameters from pushCfg.
+func loadConfigAndValidateInput(pushCfg *Config) (*config.Config, error) {
 	if pushCfg.ConfigPath == "" {
-		// Config path is now required by kong
 		return nil, errors.New("configuration file path is required")
 	}
 
 	slog.Info("Loading configuration file", "path", pushCfg.ConfigPath)
-	// Load config, ignoring own private key errors as push uses the master key
 	appCfg, err := config.LoadConfigIgnoreOwnKey(pushCfg.ConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load configuration file %q: %w", pushCfg.ConfigPath, err)
@@ -51,9 +49,8 @@ func loadConfigAndDeriveTargets(pushCfg *Config) (*config.Config, error) {
 		if appCfg.LoadedPeers == nil || len(appCfg.LoadedPeers) == 0 {
 			return nil, errors.New("config file specified but contains no peers to use as targets")
 		}
-		// Endpoints are validated during config.LoadConfig, so we assume they exist here.
 		for name, peerCfg := range appCfg.LoadedPeers {
-			if peerCfg.Endpoint != "" { // Only add peers with endpoints as targets
+			if peerCfg.Endpoint != "" {
 				pushCfg.Targets = append(pushCfg.Targets, peerCfg.Endpoint)
 			} else {
 				slog.Debug("Skipping peer as target (no endpoint defined)", "peer_name", name)
@@ -61,12 +58,24 @@ func loadConfigAndDeriveTargets(pushCfg *Config) (*config.Config, error) {
 		}
 		slog.Info("Using targets derived from config file", "count", len(pushCfg.Targets))
 	}
+
+	// Validate Inputs (Post-Config Load/Derivation)
+	if pushCfg.Threshold <= 0 {
+		return nil, fmt.Errorf("threshold must be positive, got %d", pushCfg.Threshold)
+	}
+	if len(pushCfg.Readers) == 0 {
+		return nil, errors.New("at least one reader must be specified")
+	}
+	if len(pushCfg.Targets) == 0 {
+		return nil, errors.New("no targets specified. Provide via --target flags or derive from --config file")
+	}
+	// Key and Secret presence is ensured by `kong:"required"`
+
 	return appCfg, nil
 }
 
-// prepareFragments splits the secret and encrypts fragments for each owner peer defined in the config,
-// respecting the FragmentsPerOwner setting for each peer.
-func prepareFragments(secret string, threshold int, appCfg *config.Config) (map[string]*pb.FragmentList, error) {
+// createEncryptedFragments splits the secret and encrypts fragments for each owner peer.
+func createEncryptedFragments(secret string, threshold int, appCfg *config.Config) (map[string]*pb.FragmentList, error) {
 	// Identify owner peers (those with loaded encrypters AND endpoints in the config)
 	// and calculate total parts needed.
 	ownerPeers := make(map[string]*config.PeerConfig)
@@ -143,30 +152,32 @@ func prepareFragments(secret string, threshold int, appCfg *config.Config) (map[
 	return ownerEncryptedFragments, nil
 }
 
-// buildAndSignEntry constructs the protobuf Entry and signs it.
-func buildAndSignEntry(pushCfg *Config, ownerEncryptedFragments map[string]*pb.FragmentList, masterSigner tink.Signer) (*pb.Entry, error) {
+// prepareAndSignEntry creates encrypted fragments, builds the protobuf Entry, and signs it.
+func prepareAndSignEntry(pushCfg *Config, appCfg *config.Config, masterSigner tink.Signer) (*pb.Entry, error) {
+	ownerEncryptedFragments, err := createEncryptedFragments(pushCfg.Secret, pushCfg.Threshold, appCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to prepare fragments: %w", err)
+	}
+
 	entry := &pb.Entry{
 		Timestamp:      timestamppb.Now(),
 		Key:            pushCfg.Key,
-		Readers:        pushCfg.Readers, // Already a slice of strings
+		Readers:        pushCfg.Readers,
 		OwnerFragments: ownerEncryptedFragments,
 		Threshold:      int32(pushCfg.Threshold),
-		// Signature will be added next
 	}
 	slog.Debug("Constructed entry structure", "key", entry.Key, "timestamp", entry.Timestamp.AsTime(), "threshold", entry.Threshold)
 
-	// Sign Entry
 	slog.Debug("Signing entry with master key")
-	err := crypto.SignEntry(masterSigner, entry)
-	if err != nil {
+	if err := crypto.SignEntry(masterSigner, entry); err != nil {
 		return nil, fmt.Errorf("failed to sign entry: %w", err)
 	}
 	slog.Info("Entry signed successfully")
 	return entry, nil
 }
 
-// pushEntryToTargets pushes the signed entry to all target nodes concurrently.
-func pushEntryToTargets(targets []string, entry *pb.Entry) (successCount, errorCount int) {
+// distributeEntryToPeers pushes the signed entry to all target nodes concurrently.
+func distributeEntryToPeers(targets []string, entry *pb.Entry) (successCount, errorCount int) {
 	pushRequest := &pb.PushRequest{Entry: entry}
 	var wg sync.WaitGroup
 	var mu sync.Mutex // To protect counters
@@ -224,31 +235,13 @@ func pushEntryToTargets(targets []string, entry *pb.Entry) (successCount, errorC
 func Run(pushCfg *Config) int {
 	slog.Info("Starting push operation...")
 
-	// --- Load Config and derive targets ---
-	appCfg, err := loadConfigAndDeriveTargets(pushCfg)
+	appCfg, err := loadConfigAndValidateInput(pushCfg)
 	if err != nil {
-		slog.Error("Failed to load or process configuration", "err", err)
+		slog.Error("Failed to load or validate configuration/input", "err", err)
 		return 1
 	}
 
-	// --- Validate Inputs (Post-Config Load/Derivation) ---
-	// Threshold validation remains (checked against calculated total parts in prepareFragments)
-	if pushCfg.Threshold <= 0 {
-		slog.Error("Threshold must be positive", "threshold", pushCfg.Threshold)
-		return 1
-	}
-	if len(pushCfg.Readers) == 0 {
-		slog.Error("At least one reader must be specified")
-		return 1
-	}
-	if len(pushCfg.Targets) == 0 {
-		slog.Error("No targets specified. Provide via --target flags or derive from --config file.")
-		return 1
-	}
-
-	// --- Load Master Signing Key ---
 	slog.Debug("Loading master private key (signer)", "path", pushCfg.MasterPrivateKeyPath)
-	// Use the generic LoadSigner function
 	masterSigner, err := crypto.LoadSigner(pushCfg.MasterPrivateKeyPath)
 	if err != nil {
 		slog.Error("Failed to load master private key (signer)", "path", pushCfg.MasterPrivateKeyPath, "err", err)
@@ -256,26 +249,18 @@ func Run(pushCfg *Config) int {
 	}
 	slog.Info("Loaded master private key (signer) successfully")
 
-	// --- Split Secret and Encrypt Fragments ---
-	// Owners, their keys, and fragment counts are derived directly from appCfg
-	ownerEncryptedFragments, err := prepareFragments(pushCfg.Secret, pushCfg.Threshold, appCfg)
+	entry, err := prepareAndSignEntry(pushCfg, appCfg, masterSigner)
 	if err != nil {
-		slog.Error("Failed to prepare fragments", "err", err)
+		slog.Error("Failed to prepare or sign entry", "err", err)
 		return 1
 	}
 
-	// --- Construct and Sign Entry ---
-	entry, err := buildAndSignEntry(pushCfg, ownerEncryptedFragments, masterSigner)
-	if err != nil {
-		slog.Error("Failed to build or sign entry", "err", err)
-		return 1
-	}
-
-	// --- Push to Targets ---
-	_, errorCount := pushEntryToTargets(pushCfg.Targets, entry)
-
+	_, errorCount := distributeEntryToPeers(pushCfg.Targets, entry)
 	if errorCount > 0 {
-		return 1 // Exit with error if any push failed
+		slog.Error("Push operation completed with errors", "failed_targets", errorCount)
+		return 1
 	}
-	return 0 // Exit successfully
+
+	slog.Info("Push operation completed successfully")
+	return 0
 }
