@@ -21,8 +21,7 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// Represents a single secret entry stored in the vault
-// Represents a list of fragments, typically associated with one owner IP.
+// Represents a list of SSS fragments, typically associated with one owner node.
 type FragmentList struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Fragments     [][]byte               `protobuf:"bytes,1,rep,name=fragments,proto3" json:"fragments,omitempty"`

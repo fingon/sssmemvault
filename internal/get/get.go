@@ -104,7 +104,7 @@ func findEntryOnNetwork(getCfg *Config, clientSigner tink.Signer, appCfg *config
 }
 
 // determineOwnerEndpoints finds the gRPC endpoints for the given owner names using the loaded config.
-func determineOwnerEndpoints(appCfg *config.Config, ownerNames []string) (map[string]string, error) {
+func determineOwnerEndpoints(appCfg *config.Config, ownerNames []string, configFilePath string) (map[string]string, error) {
 	if appCfg == nil {
 		return nil, errors.New("internal error: configuration not loaded")
 	}
@@ -126,8 +126,7 @@ func determineOwnerEndpoints(appCfg *config.Config, ownerNames []string) (map[st
 		slog.Debug("Found endpoint for owner", "owner_name", ownerName, "endpoint", peerCfg.Endpoint)
 	}
 	if len(missingEndpoints) > 0 {
-		// Use a config path field if available, or just the list
-		return nil, fmt.Errorf("could not find endpoints for all owners in configuration file %q: %v", appCfg.PrivateKeyPath, missingEndpoints)
+		return nil, fmt.Errorf("could not find endpoints for all owners in configuration file %q: %v", configFilePath, missingEndpoints)
 	}
 	return ownerEndpoints, nil
 }
@@ -217,7 +216,7 @@ func retrieveAndDecryptFragments(getCfg *Config, appCfg *config.Config, latestEn
 	sort.Strings(ownerNames) // Sort for consistent logging
 	slog.Info("Identified owners for the entry", "key", getCfg.Key, "owners", ownerNames)
 
-	ownerEndpoints, err := determineOwnerEndpoints(appCfg, ownerNames)
+	ownerEndpoints, err := determineOwnerEndpoints(appCfg, ownerNames, getCfg.ConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine owner endpoints: %w", err)
 	}

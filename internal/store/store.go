@@ -13,6 +13,9 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// ErrNotFound is returned when a requested entry is not found in the store.
+var ErrNotFound = errors.New("entry not found")
+
 // InMemoryStore implements an in-memory storage for secret entries.
 // It ensures that only the entry with the latest timestamp for a given key is kept.
 type InMemoryStore struct {
@@ -81,7 +84,7 @@ func (self *InMemoryStore) GetEntry(key string, timestamp *timestamppb.Timestamp
 
 	latestEntry, exists := self.entries[key]
 	if !exists {
-		return nil, fmt.Errorf("entry not found for key %q", key) // Consider specific error type e.g., ErrNotFound
+		return nil, fmt.Errorf("%w for key %q", ErrNotFound, key)
 	}
 
 	// Check if the requested timestamp matches the latest stored timestamp
@@ -91,8 +94,8 @@ func (self *InMemoryStore) GetEntry(key string, timestamp *timestamppb.Timestamp
 	}
 
 	// Requested timestamp does not match the latest (and only) stored version
-	return nil, fmt.Errorf("entry found for key %q, but timestamp %s does not match stored timestamp %s",
-		key, timestamp.AsTime(), latestEntry.Timestamp.AsTime()) // Consider specific error type
+	return nil, fmt.Errorf("entry found for key %q, but timestamp %s does not match stored timestamp %s: %w",
+		key, timestamp.AsTime(), latestEntry.Timestamp.AsTime(), ErrNotFound)
 }
 
 // GetLatestEntry retrieves the latest known version of an entry for a given key.
@@ -106,7 +109,7 @@ func (self *InMemoryStore) GetLatestEntry(key string) (*pb.Entry, error) {
 
 	latestEntry, exists := self.entries[key]
 	if !exists {
-		return nil, fmt.Errorf("entry not found for key %q", key) // Consider specific error type e.g., ErrNotFound
+		return nil, fmt.Errorf("%w for key %q", ErrNotFound, key)
 	}
 
 	// Return a clone to prevent modification of the stored entry

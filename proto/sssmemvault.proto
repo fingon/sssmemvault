@@ -18,8 +18,7 @@ service SssMemVault {
   rpc Push(PushRequest) returns (PushResponse);
 }
 
-// Represents a single secret entry stored in the vault
-// Represents a list of fragments, typically associated with one owner IP.
+// Represents a list of SSS fragments, typically associated with one owner node.
 message FragmentList {
   repeated bytes fragments = 1;
 }

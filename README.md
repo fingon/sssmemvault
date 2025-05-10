@@ -191,7 +191,8 @@ This file is used by the `daemon` command and is **required** by `push` and `get
 
 # --- Daemon Settings ---
 # Path to the node's combined private keyset file (signing + hybrid).
-private_key_path: "node_private.json" # Node A uses nodeA_private.json, Node B uses nodeB_private.json
+# This path should be specific to each node. For example, on Node A, this might be "nodeA_private.json".
+private_key_path: "nodeA_private.json" # Example for Node A
 # Path to the master public key file (signing only, used to verify pushed entry signatures).
 master_public_key_path: "master_public.json"
 # Address and port the daemon listens on.
@@ -231,25 +232,49 @@ peers:
 Ensure the `sssmemvault` binary is built (`make sssmemvault`).
 
 **On Node A:**
-*   Copy `config.yaml`.
+*   Create/Copy `config.yaml`.
 *   Ensure `nodeA_private.json`, `master_public.json`, `nodeB_public.json`, `clientX_public.json` are accessible.
-*   Crucially, rename/copy `nodeA_private.json` to match the `private_key_path` in `config.yaml` (e.g., `node_private.json`).
+*   Edit `config.yaml` on Node A so that `private_key_path` points to `nodeA_private.json`.
 
 ```bash
-# Assuming config.yaml uses "node_private.json"
-cp nodeA_private.json node_private.json
+# Example: config.yaml on Node A should have:
+# private_key_path: "nodeA_private.json"
+# master_public_key_path: "master_public.json"
+# ...
+# peers:
+#   "node-A":
+#     public_key_path: "nodeA_public.json"
+#     endpoint: "node-a.example.com:59240"
+#   "node-B":
+#     public_key_path: "nodeB_public.json"
+#     endpoint: "node-b.example.com:59240"
+#     poll_interval: "60s"
+#   "client-X":
+#     public_key_path: "clientX_public.json"
 
 ./sssmemvault daemon --config config.yaml --my-name node-A --loglevel debug
 ```
 
 **On Node B:**
-*   Copy `config.yaml`.
+*   Create/Copy `config.yaml`.
 *   Ensure `nodeB_private.json`, `master_public.json`, `nodeA_public.json`, `clientX_public.json` are accessible.
-*   Rename/copy `nodeB_private.json` to match the `private_key_path` in `config.yaml`.
+*   Edit `config.yaml` on Node B so that `private_key_path` points to `nodeB_private.json`.
 
 ```bash
-# Assuming config.yaml uses "node_private.json"
-cp nodeB_private.json node_private.json
+# Example: config.yaml on Node B should have:
+# private_key_path: "nodeB_private.json"
+# master_public_key_path: "master_public.json"
+# ...
+# peers:
+#   "node-A":
+#     public_key_path: "nodeA_public.json"
+#     endpoint: "node-a.example.com:59240"
+#     poll_interval: "60s" # Node B polls Node A
+#   "node-B":
+#     public_key_path: "nodeB_public.json"
+#     endpoint: "node-b.example.com:59240"
+#   "client-X":
+#     public_key_path: "clientX_public.json"
 
 ./sssmemvault daemon --config config.yaml --my-name node-B --loglevel debug
 ```
