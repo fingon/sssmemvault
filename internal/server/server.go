@@ -58,7 +58,7 @@ func AuthInterceptor(cfg *config.Config) grpc.UnaryServerInterceptor {
 		slog.Debug("AuthInterceptor: processing request", "method", info.FullMethod)
 
 		// Skip authentication for the Push method, which relies on master key signature verification
-		if info.FullMethod == "/sssmemvault.SssMemVault/Push" {
+		if info.FullMethod == pb.SssMemVault_Push_FullMethodName {
 			slog.Debug("AuthInterceptor: skipping peer auth for Push method")
 			return handler(ctx, req)
 		}
