@@ -109,8 +109,7 @@ func setupGRPCServer(appCfg *config.Config, localStore *store.InMemoryStore, myN
 // setupSignalHandling sets up handling for SIGINT and SIGTERM.
 func setupSignalHandling() chan os.Signal {
 	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP) // Add SIGHUP for reload trigger
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP) // Listen for INT, TERM, HUP
 	return signalChan
 }
 
@@ -350,13 +349,13 @@ func runCoreDaemonLogic(daemonCfg *Config) int {
 			keepRunning = false // Exit loop on gRPC error or clean stop
 		case sig := <-signalChan:
 			slog.Info("Received OS signal", "signal", sig)
-			if sig == syscall.SIGHUP {
+			switch sig {
+			case syscall.SIGHUP:
 				slog.Info("SIGHUP received, initiating configuration reload...")
-				// Signal reload by breaking inner select; loop will continue
-			} else {
-				// SIGINT or SIGTERM
-				slog.Info("Shutdown signal received, initiating graceful shutdown...")
-				keepRunning = false // Exit loop
+				// The loop will continue, leading to a reload, because keepRunning remains true.
+			case syscall.SIGINT, syscall.SIGTERM:
+				slog.Info("Shutdown signal received, initiating graceful shutdown...", "signal", sig)
+				keepRunning = false // Signal the loop to exit for shutdown.
 			}
 		case <-reloadSignal:
 			slog.Info("Internal reload signal received, initiating configuration reload...")
