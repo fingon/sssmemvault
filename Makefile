@@ -4,8 +4,8 @@
 # Copyright (c) 2025 Markus Stenberg
 #
 # Created:       Sun Apr 13 08:23:25 2025 mstenber
-# Last modified: Wed May 21 18:21:33 2025 mstenber
-# Edit time:     16 min
+# Last modified: Wed May 21 20:55:30 2025 mstenber
+# Edit time:     21 min
 #
 #
 
@@ -67,6 +67,7 @@ lint:
 
 
 $(BINARY): $(wildcard *.go */*.go */*/*.go)
+	go test ./cmd/sssmemvault -count 1
 	go build -o $@ ./cmd/$@
 
 # Clean target (optional but good practice)
