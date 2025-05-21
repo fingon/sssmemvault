@@ -413,7 +413,7 @@ func (self *Config) Run() error {
 			PidFilePerm: 0o644,
 			LogFileName: self.LogFile, // Redirect stdout/stderr to log file
 			LogFilePerm: 0o644,
-			WorkDir:     "/",   // Or keep current? Consider making configurable if needed.
+			WorkDir:     "",    // Keep current
 			Umask:       0o027, // Restrict file permissions created by daemon
 		}
 
