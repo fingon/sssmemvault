@@ -416,8 +416,9 @@ func (self *Config) Run() error {
 
 		d, err := cntxt.Reborn()
 		if err != nil {
+			// Probably old instance is running, which is fine?
 			slog.Error("Failed to detach daemon process", "err", err)
-			return err
+			return nil
 		}
 		if d != nil {
 			// Parent process: successfully detached, exit gracefully.

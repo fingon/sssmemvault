@@ -153,7 +153,7 @@ Use `sssmemvault <command> --help` for details on each subcommand's flags.
 
 This example demonstrates setting up two nodes (`node-A`, `node-B`) and a client (`client-X`) and using the commands.
 
-We will use the `sssmemvault genkeys` command to generate the necessary combined keysets. Node endpoints are assumed to be `node-a.example.com:59240` and `node-b.example.com:59240`.
+We will use the `sssmemvault gen keys` command to generate the necessary combined keysets. Node endpoints are assumed to be `node-a.example.com:59240` and `node-b.example.com:59240`.
 
 **1. Generate Master Key Pair (Signing Only)**
 
