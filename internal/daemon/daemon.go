@@ -138,17 +138,14 @@ func startServices(ctx context.Context, grpcServer *grpc.Server, lis net.Listene
 	syncDoneChan = make(chan struct{})
 
 	// Start synchronizer
-	go func() {
-		defer close(syncDoneChan) // Ensure channel is closed when goroutine exits
-		syncr.Start(ctx)          // Start blocks until context is cancelled
-		syncr.Stop()              // Wait for poll loops to finish after context cancellation
-		slog.Debug("Synchronizer goroutine finished")
-	}()
+	syncr.Start(ctx)
 
 	// Start GRPC server
 	go func() {
+		defer close(syncDoneChan) // Ensure channel is closed when goroutine exits
 		slog.Info("Starting GRPC server...")
 		grpcErrChan <- grpcServer.Serve(lis)
+		syncr.Stop() // Wait for poll loops to finish after context cancellation
 	}()
 
 	return grpcErrChan, syncDoneChan
