@@ -20,10 +20,10 @@ import (
 
 // Config holds the specific configuration needed for the genkeys subcommand.
 type Config struct {
-	PrivateKeyOut string `kong:"name='private-out',required,help='Path to write the combined private keyset file (JSON).'"`
-	PublicKeyOut  string `kong:"name='public-out',required,help='Path to write the combined public keyset file (JSON).'"`
 	Force         bool   `kong:"name='force',short='f',help='Overwrite existing key files.'"`
-	// LogLevel is handled globally
+	Prefix        string `kong:"name='prefix',help='Prefix for generating private and public key files.'"`
+	PrivateKeyOut string `kong:"name='private-out',help='Path to write the combined private keyset file (JSON).'"`
+	PublicKeyOut  string `kong:"name='public-out',help='Path to write the combined public keyset file (JSON).'"`
 }
 
 // FileExists checks if a file exists and is not a directory.
@@ -95,6 +95,11 @@ func WriteKeyset(handle *keyset.Handle, path string) error {
 // Run executes the genkeys operation.
 func (cfg *Config) Run() error {
 	slog.Info("Starting key generation...")
+
+	if cfg.Prefix != "" {
+		cfg.PrivateKeyOut = cfg.Prefix + "_private.json"
+		cfg.PublicKeyOut = cfg.Prefix + "_public.json"
+	}
 
 	// --- Check if files exist ---
 	if !cfg.Force {

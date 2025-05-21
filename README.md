@@ -151,16 +151,24 @@ We will use the `sssmemvault genkeys` command to generate the necessary combined
 Only the master *signing* public key is needed by the nodes. Keep the master *signing* private key secure and offline (used only by `sssmemvault push`).
 
 ```bash
+./sssmemvault gen sign --prefix master
+
+or
+
 ./sssmemvault gen sign \
   --private-out master_private.json \
   --public-out master_public.json
-```
+  ```
 
 **2. Generate Node A Combined Keyset**
 
 Use the `sssmemvault gen keys` command.
 
 ```bash
+./sssmemvault gen keys --prefix nodeA
+
+or
+
 ./sssmemvault gen keys \
   --private-out nodeA_private.json \
   --public-out nodeA_public.json
@@ -169,17 +177,13 @@ Use the `sssmemvault gen keys` command.
 **3. Generate Node B Combined Keyset**
 
 ```bash
-./sssmemvault gen keys \
-  --private-out nodeB_private.json \
-  --public-out nodeB_public.json
+./sssmemvault gen keys --prefix nodeB
 ```
 
 **4. Generate Client Combined Keyset**
 
 ```bash
-./sssmemvault gen keys \
-  --private-out clientX_private.json \
-  --public-out clientX_public.json
+./sssmemvault gen keys --prefix clientX
 ```
 
 **5. Create Configuration File (`config.yaml`)**

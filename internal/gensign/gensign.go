@@ -11,13 +11,19 @@ import (
 )
 
 type Config struct {
-	PrivateKeyOut string `kong:"name='private-out',required,help='Path to write the signing private keyset file (JSON).'"`
-	PublicKeyOut  string `kong:"name='public-out',required,help='Path to write the signing public keyset file (JSON).'"`
 	Force         bool   `kong:"name='force',short='f',help='Overwrite existing key files.'"`
+	Prefix        string `kong:"name='prefix',help='Prefix for generating private and public key files.'"`
+	PrivateKeyOut string `kong:"name='private-out',help='Path to write the signing private keyset file (JSON).'"`
+	PublicKeyOut  string `kong:"name='public-out',help='Path to write the signing public keyset file (JSON).'"`
 }
 
 func (cfg *Config) Run() error {
 	slog.Info("Starting key generation...")
+
+	if cfg.Prefix != "" {
+		cfg.PrivateKeyOut = cfg.Prefix + "_private.json"
+		cfg.PublicKeyOut = cfg.Prefix + "_public.json"
+	}
 
 	if !cfg.Force {
 		if genkeys.FileExists(cfg.PrivateKeyOut) {
