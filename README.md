@@ -265,7 +265,7 @@ Ensure the `sssmemvault` binary is built (`make sssmemvault`).
 #   "client-X":
 #     public_key_path: "clientX_public.json"
 
-./sssmemvault daemon --config config.yaml --my-name node-A --loglevel debug
+./sssmemvault daemon --config config.yaml --my-name node-A --log-level debug
 ```
 
 **On Node B:**
@@ -289,7 +289,7 @@ Ensure the `sssmemvault` binary is built (`make sssmemvault`).
 #   "client-X":
 #     public_key_path: "clientX_public.json"
 
-./sssmemvault daemon --config config.yaml --my-name node-B --loglevel debug
+./sssmemvault daemon --config config.yaml --my-name node-B --log-level debug
 ```
 
 The nodes will now start, load their respective combined private keysets, connect to peers defined in the config, listen for requests, poll peers with `poll_interval`, and automatically reload their configuration if the `config.yaml` file is modified (unless `--config-check-interval=0s` is used). You can also trigger a reload manually by sending a `SIGHUP` signal (e.g., `kill -HUP <pid>`).
@@ -304,7 +304,7 @@ To run in the background (detached mode):
   --detach \
   --pidfile /var/run/sssmemvaultd-nodeA.pid \
   --logfile /var/log/sssmemvaultd-nodeA.log \
-  --loglevel info
+  --log-level info
 ```
 
 **7. Provisioning a Secret (`sssmemvault push`)**
@@ -328,7 +328,7 @@ Use the `sssmemvault push` subcommand. This requires the *master signing private
   --key "api-key" \
   --secret "supersecret123" \
   --threshold 2 \
-  --loglevel info
+  --log-level info
 ```
 
 This command will:

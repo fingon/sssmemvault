@@ -226,7 +226,7 @@ func retrieveAndDecryptFragments(getCfg *Config, appCfg *config.Config, latestEn
 	encryptedFragments, getDecodedErrors := fetchEncryptedFragmentsFromOwners(getDecodedCtx, ownerEndpoints, getCfg.ClientName, clientSigner, latestEntry)
 
 	if len(getDecodedErrors) > 0 {
-		slog.Error("Failed to retrieve fragments from some owners", "errors", getDecodedErrors)
+		slog.Warn("Failed to retrieve fragments from some owners", "errors", getDecodedErrors)
 		// Continue, maybe enough fragments were retrieved
 	}
 	if len(encryptedFragments) == 0 {
