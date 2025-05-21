@@ -4,8 +4,8 @@
 # Copyright (c) 2025 Markus Stenberg
 #
 # Created:       Sun Apr 13 08:23:25 2025 mstenber
-# Last modified: Wed May 21 16:10:37 2025 mstenber
-# Edit time:     8 min
+# Last modified: Wed May 21 17:26:32 2025 mstenber
+# Edit time:     9 min
 #
 #
 
@@ -18,7 +18,7 @@ GENERATED=\
 BINARY=sssmemvault
 
 .PHONY: all
-all: ci
+all: ci $(BINARY)
 
 .PHONY: binaries
 binaries: $(BINARY)
