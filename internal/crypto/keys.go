@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 
@@ -28,6 +29,15 @@ func loadKeysetHandle(path string) (*keyset.Handle, error) {
 	return kh, nil
 }
 
+// loadKeysetHandleFromValue reads a JSON keyset string and returns a keyset handle.
+func loadKeysetHandleFromValue(jsonKeyset string) (*keyset.Handle, error) {
+	kh, err := insecurecleartextkeyset.Read(keyset.NewJSONReader(bytes.NewReader([]byte(jsonKeyset))))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read keyset from value: %w", err)
+	}
+	return kh, nil
+}
+
 // getPrimitivesFromKeysetFile loads a keyset handle from a file and returns its PrimitiveSet.
 // This helper centralizes the initial steps common to loading specific primitives.
 func getPrimitivesFromKeysetFile(path string) (*primitiveset.PrimitiveSet, error) {
@@ -38,6 +48,19 @@ func getPrimitivesFromKeysetFile(path string) (*primitiveset.PrimitiveSet, error
 	ps, err := kh.Primitives()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get primitives from keyset %q: %w", path, err)
+	}
+	return ps, nil
+}
+
+// getPrimitivesFromKeysetValue loads a keyset handle from a string value and returns its PrimitiveSet.
+func getPrimitivesFromKeysetValue(jsonKeyset string) (*primitiveset.PrimitiveSet, error) {
+	kh, err := loadKeysetHandleFromValue(jsonKeyset)
+	if err != nil {
+		return nil, err
+	}
+	ps, err := kh.Primitives()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get primitives from keyset value: %w", err)
 	}
 	return ps, nil
 }
@@ -54,6 +77,19 @@ func LoadSigner(path string) (tink.Signer, error) {
 	signer, ok := ps.Primary.Primitive.(tink.Signer)
 	if !ok {
 		return nil, fmt.Errorf("primary primitive in keyset %q is not a tink.Signer", path)
+	}
+	return signer, nil
+}
+
+// LoadSignerFromValue loads the Signer primitive from a keyset JSON string.
+func LoadSignerFromValue(jsonKeyset string) (tink.Signer, error) {
+	ps, err := getPrimitivesFromKeysetValue(jsonKeyset)
+	if err != nil {
+		return nil, err
+	}
+	signer, ok := ps.Primary.Primitive.(tink.Signer)
+	if !ok {
+		return nil, errors.New("primary primitive in keyset value is not a tink.Signer")
 	}
 	return signer, nil
 }

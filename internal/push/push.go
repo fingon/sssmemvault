@@ -18,12 +18,13 @@ import (
 
 // Config holds the specific configuration needed for the push subcommand.
 type Config struct {
-	// LogLevel is handled globally
-	MasterPrivateKeyPath string   `kong:"name='master-private-key',required,help='Path to the master private key JSON file (signing only).'"`
-	Readers              []string `kong:"name='reader',required,help='Name of a node allowed to read the secret. Repeat for each reader.'"`
-	Key                  string   `kong:"name='key',required,help='The key name for the secret.'"`
-	Secret               string   `kong:"name='secret',required,help='The secret value to store.'"`
-	Threshold            int      `kong:"name='threshold',short='t',required,help='Shamir threshold (number of fragments needed to reconstruct).'"`
+	MasterPrivateKeyPath string `kong:"name='master-private-key',required,xor='key-source',help='Path to the master private key JSON file (signing only).'"`
+	MasterPrivateKey     string `kong:"name='master-private-key-value',required,xor='key-source',env='SSSMEMVAULT_MASTER_PRIVATE_KEY',help='The master private key JSON content (signing only). Can be supplied via SSSMEMVAULT_MASTER_PRIVATE_KEY environment variable.'"`
+
+	Readers   []string `kong:"name='reader',required,help='Name of a node allowed to read the secret. Repeat for each reader.'"`
+	Key       string   `kong:"name='key',required,help='The key name for the secret.'"`
+	Secret    string   `kong:"name='secret',required,help='The secret value to store.'"`
+	Threshold int      `kong:"name='threshold',short='t',required,help='Shamir threshold (number of fragments needed to reconstruct).'"`
 	// Parts is now calculated based on sum of fragments_per_owner in config for owner peers.
 	Targets    []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
 	ConfigPath string   `kong:"name='config',required,help='Path to a configuration file to load parameters from (peers, targets).'"`
@@ -241,11 +242,21 @@ func (pushCfg *Config) Run() error {
 		return err
 	}
 
-	slog.Debug("Loading master private key (signer)", "path", pushCfg.MasterPrivateKeyPath)
-	masterSigner, err := crypto.LoadSigner(pushCfg.MasterPrivateKeyPath)
-	if err != nil {
-		slog.Error("Failed to load master private key (signer)", "path", pushCfg.MasterPrivateKeyPath, "err", err)
-		return err
+	var masterSigner tink.Signer
+	if pushCfg.MasterPrivateKey != "" {
+		slog.Debug("Loading master private key from value (environment variable or direct input)")
+		masterSigner, err = crypto.LoadSignerFromValue(pushCfg.MasterPrivateKey)
+		if err != nil {
+			slog.Error("Failed to load master private key from value", "err", err)
+			return err
+		}
+	} else { // pushCfg.MasterPrivateKeyPath must be present due to loadConfigAndValidateInput
+		slog.Debug("Loading master private key (signer) from path", "path", pushCfg.MasterPrivateKeyPath)
+		masterSigner, err = crypto.LoadSigner(pushCfg.MasterPrivateKeyPath)
+		if err != nil {
+			slog.Error("Failed to load master private key (signer) from path", "path", pushCfg.MasterPrivateKeyPath, "err", err)
+			return err
+		}
 	}
 	slog.Info("Loaded master private key (signer) successfully")
 
