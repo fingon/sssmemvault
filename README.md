@@ -124,6 +124,15 @@ make sssmemvault
 
 This creates the `sssmemvault` binary.
 
+You can alternatively run
+
+```bash
+make binaries
+```
+
+to build the defined binaries for various arch/os combinations I use to build/.
+
+
 ## Commands ##
 
 The `sssmemvault` tool has five subcommands:

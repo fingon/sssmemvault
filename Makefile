@@ -4,27 +4,38 @@
 # Copyright (c) 2025 Markus Stenberg
 #
 # Created:       Sun Apr 13 08:23:25 2025 mstenber
-# Last modified: Wed May 21 17:26:32 2025 mstenber
-# Edit time:     9 min
+# Last modified: Wed May 21 18:21:33 2025 mstenber
+# Edit time:     16 min
 #
 #
 
 GO_TEST_TARGET=./...
 
+BINARY=sssmemvault
+
+BINARIES=$(BINARY) \
+	build/sssmemvault.linux-amd64 build/sssmemvault.darwin-arm64
+
 GENERATED=\
 	proto/sssmemvault.pb.go \
 	proto/sssmemvault_grpc.pb.go
 
-BINARY=sssmemvault
-
 .PHONY: all
-all: ci $(BINARY)
+all: ci binaries
 
 .PHONY: binaries
-binaries: $(BINARY)
+binaries: $(BINARIES)
+
+build/sssmemvault.linux-amd64: $(wildcard *.go */*.go */*/*.go)
+	@mkdir -p build
+	GOOS=linux GOARCH=amd64 go build -o $@ ./cmd/sssmemvault
+
+build/sssmemvault.darwin-arm64: $(wildcard *.go */*.go */*/*.go)
+	@mkdir -p build
+	GOOS=darwin GOARCH=arm64 go build -o $@ ./cmd/sssmemvault
 
 .PHONY: ci
-ci: lint test $(BINARY)
+ci: lint test
 
 .PHONY: generate
 generate: $(GENERATED)
@@ -54,10 +65,11 @@ lint:
 	mv $@.tmp $@
 	go tool goimports -w $@
 
+
 $(BINARY): $(wildcard *.go */*.go */*/*.go)
 	go build -o $@ ./cmd/$@
 
 # Clean target (optional but good practice)
 .PHONY: clean
 clean:
-	rm -f $(BINARY) $(GENERATED)
+	rm -f $(BINARIES) $(GENERATED)
