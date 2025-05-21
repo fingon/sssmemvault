@@ -19,6 +19,7 @@ import (
 	"github.com/fingon/sssmemvault/internal/store"
 	"github.com/fingon/sssmemvault/internal/synchronizer"
 	pb "github.com/fingon/sssmemvault/proto"
+	godaemon "github.com/sevlyar/go-daemon"
 	"google.golang.org/grpc"
 )
 
@@ -53,6 +54,23 @@ type Config struct {
 	PidFileDefault             string `kong:"-"`
 	LogFileDefault             string `kong:"-"`
 	ConfigCheckIntervalDefault string `kong:"-"`
+}
+
+// setupDetachedLogging redirects logging to a file when running detached.
+func setupDetachedLogging(logFile string, level slog.Level) error {
+	// Open the log file
+	file, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file %q: %w", logFile, err)
+	}
+	// Note: We don't close the file here, as the detached process needs it.
+	// The OS will close it on process exit.
+
+	// Create a new handler writing to the file
+	logHandler := slog.NewTextHandler(file, &slog.HandlerOptions{Level: level})
+	slog.SetDefault(slog.New(logHandler))
+	slog.Info("Logging redirected to file for detached mode", "file", logFile, "level", level)
+	return nil
 }
 
 // --- Global State for Reloading ---
@@ -311,13 +329,13 @@ func stopDaemonServices(state *daemonState, syncDoneChan chan struct{}) {
 }
 
 // runCoreDaemonLogic sets up and runs the main daemon services within a loop for reloading.
-func runCoreDaemonLogic(daemonCfg *Config) int {
+func runCoreDaemonLogic(daemonCfg *Config) error {
 	// Main loop for handling reloads
 	for {
 		state, err := initializeDaemonState(daemonCfg)
 		if err != nil {
 			slog.Error("Daemon initialization failed", "err", err)
-			return 1 // Fatal if initial setup fails
+			return err
 		}
 
 		grpcErrChan, syncDoneChan := startDaemonServices(state)
@@ -335,14 +353,14 @@ func runCoreDaemonLogic(daemonCfg *Config) int {
 
 		// Wait for shutdown signal, reload signal, or gRPC server error
 		signalChan := setupSignalHandling()
-		exitCode := 0
+		var resultErr error
 		keepRunning := true
 
 		select {
 		case err := <-grpcErrChan:
 			if err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 				slog.Error("GRPC server failed", "err", err)
-				exitCode = 1 // Indicate error on exit
+				resultErr = err
 			} else {
 				slog.Info("GRPC server stopped cleanly")
 			}
@@ -377,7 +395,7 @@ func runCoreDaemonLogic(daemonCfg *Config) int {
 
 		if !keepRunning {
 			slog.Info("Exiting daemon main loop.")
-			return exitCode // Exit the main function and return
+			return resultErr
 		}
 
 		// If we are here, it means a reload was triggered (SIGHUP or internal signal)
@@ -387,10 +405,47 @@ func runCoreDaemonLogic(daemonCfg *Config) int {
 }
 
 // Run starts the sssmemvault daemon, handling the main lifecycle including reloads.
-func Run(daemonCfg *Config) int {
+func (self *Config) Run() error {
+	// --- Handle Detach ---
+	if self.Detach {
+		cntxt := &godaemon.Context{
+			PidFileName: self.PidFile,
+			PidFilePerm: 0o644,
+			LogFileName: self.LogFile, // Redirect stdout/stderr to log file
+			LogFilePerm: 0o644,
+			WorkDir:     "/",   // Or keep current? Consider making configurable if needed.
+			Umask:       0o027, // Restrict file permissions created by daemon
+		}
+
+		d, err := cntxt.Reborn()
+		if err != nil {
+			slog.Error("Failed to detach daemon process", "err", err)
+			return err
+		}
+		if d != nil {
+			// Parent process: successfully detached, exit gracefully.
+			fmt.Printf("Daemon detached with PID %d, logging to %s\n", d.Pid, self.LogFile)
+			return nil
+		}
+		// Child process (daemon): execution continues below.
+		// Need to release the context resources in the child.
+		defer func() {
+			if err := cntxt.Release(); err != nil {
+				// Log error, but don't exit, daemon should continue
+				slog.Error("Failed to release daemon context", "err", err)
+			}
+		}()
+
+		// TODO: Allow specifying the real log level for detached mode too
+		if err := setupDetachedLogging(self.LogFile, slog.LevelInfo); err != nil {
+			slog.Error("Failed to set up detached logging", "err", err)
+		}
+		slog.Info("Daemon process started successfully in background", "pid", os.Getpid())
+	}
+
 	slog.Info("Starting sssmemvaultd daemon process...")
 	// The core logic is now in a loop within runCoreDaemonLogic
-	exitCode := runCoreDaemonLogic(daemonCfg)
-	slog.Info("sssmemvaultd daemon process finished.", "exit_code", exitCode)
-	return exitCode
+	err := runCoreDaemonLogic(self)
+	slog.Info("sssmemvaultd daemon process finished.", "err", err)
+	return err
 }

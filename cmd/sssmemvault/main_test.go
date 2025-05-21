@@ -15,7 +15,6 @@ import (
 	"github.com/fingon/sssmemvault/internal/config"
 	// Register Tink primitives
 	_ "github.com/tink-crypto/tink-go/v2/aead"
-	"github.com/tink-crypto/tink-go/v2/hybrid"
 	_ "github.com/tink-crypto/tink-go/v2/hybrid"
 	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset"
 	"github.com/tink-crypto/tink-go/v2/keyset"
@@ -60,51 +59,25 @@ type testNode struct {
 	Result  *icmd.Result
 }
 
+func runGenkeysCommand(t *testing.T, privPath, pubPath string) {
+	t.Helper()
+	getCmd := icmd.Command("go", "run", ".", "gen", "keys",
+		"--private-out", privPath,
+		"--public-out", pubPath,
+	)
+	getResult := icmd.RunCmd(getCmd)
+	getResult.Assert(t, icmd.Success)
+	t.Logf("Genkeys successful.")
+}
+
 // generateCombinedKeyset generates combined private and public keyset files.
-// This simulates the `genkeys` command for testing purposes.
 func generateCombinedKeyset(t *testing.T, dir, name string) (privPath, pubPath string) {
 	t.Helper()
 
 	privPath = filepath.Join(dir, name+"_private.json")
 	pubPath = filepath.Join(dir, name+"_public.json")
 
-	// Use KeysetManager to build the combined keyset
-	manager := keyset.NewManager()
-
-	// Add signing key
-	signingTemplate := signature.ECDSAP256KeyTemplate()
-	signingKeyID, err := manager.Add(signingTemplate) // Add returns keyID, err
-	assert.NilError(t, err, "Failed to add signing key template to manager for %s", name)
-	err = manager.SetPrimary(signingKeyID) // Set signing key as primary
-	assert.NilError(t, err, "Failed to set signing key as primary for %s", name)
-
-	// Add hybrid key
-	hybridTemplate := hybrid.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM_Key_Template()
-	_, err = manager.Add(hybridTemplate) // Add returns keyID, err - we don't need the ID here
-	assert.NilError(t, err, "Failed to add hybrid key template to manager for %s", name)
-
-	// Get the final combined handle (signing key remains primary)
-	privateHandle, err := manager.Handle()
-	assert.NilError(t, err, "Failed to get final combined handle for %s", name)
-
-	// Write private keyset
-	privBuf := new(bytes.Buffer)
-	privWriter := keyset.NewJSONWriter(privBuf)
-	err = insecurecleartextkeyset.Write(privateHandle, privWriter)
-	assert.NilError(t, err, "Failed to write private keyset for %s", name)
-	err = os.WriteFile(privPath, privBuf.Bytes(), 0o600)
-	assert.NilError(t, err, "Failed to save private keyset file for %s", name)
-
-	// Get and write public keyset
-	publicHandle, err := privateHandle.Public()
-	assert.NilError(t, err, "Failed to get public keyset handle for %s", name)
-	pubBuf := new(bytes.Buffer)
-	pubWriter := keyset.NewJSONWriter(pubBuf)
-	err = insecurecleartextkeyset.Write(publicHandle, pubWriter)
-	assert.NilError(t, err, "Failed to write public keyset for %s", name)
-	err = os.WriteFile(pubPath, pubBuf.Bytes(), 0o600)
-	assert.NilError(t, err, "Failed to save public keyset file for %s", name)
-
+	runGenkeysCommand(t, privPath, pubPath)
 	return privPath, pubPath
 }
 
@@ -301,7 +274,7 @@ func startDaemons(t *testing.T, nodeInfos map[string]peerInfo, nodeCfgPaths map[
 		cmd := icmd.Command("go", "run", ".", "daemon",
 			"--config", cfgPath,
 			"--my-name", name,
-			"--loglevel", "debug",
+			"--log-level", "debug",
 		)
 		res := icmd.StartCmd(cmd)
 		t.Logf("Started %s (PID %d) listening on %s", name, res.Cmd.Process.Pid, info.Endpoint)
@@ -375,7 +348,7 @@ func runPushCommand(t *testing.T, masterPrivKeyPath, configPath string, threshol
 		"--key", secretKey,
 		"--secret", secretValue,
 		"--threshold", strconv.Itoa(threshold),
-		"--loglevel", "info",
+		"--log-level", "info",
 	}
 	for _, r := range readers {
 		args = append(args, "--reader", r)
@@ -400,7 +373,7 @@ func runGetCommand(t *testing.T, clientName, clientPrivKeyPath, configPath, secr
 		"--config", configPath, // Use config to find peer endpoints
 		"--key", secretKey,
 		"--output", outputFilePath,
-		"--loglevel", "info",
+		"--log-level", "info",
 	)
 	getResult := icmd.RunCmd(getCmd)
 	getResult.Assert(t, icmd.Success)

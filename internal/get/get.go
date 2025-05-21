@@ -274,47 +274,47 @@ func reconstructAndOutputSecret(decryptedFragments [][]byte, threshold int32, ou
 }
 
 // Run executes the get operation.
-func Run(getCfg *Config) int {
+func (getCfg *Config) Run() error {
 	slog.Info("Starting get operation...")
 
 	appCfg, err := loadConfigAndValidateInput(getCfg)
 	if err != nil {
 		slog.Error("Failed to load or validate configuration/input", "err", err)
-		return 1
+		return err
 	}
 
 	clientSigner, clientDecrypter, err := loadClientKeys(getCfg.PrivateKeyPath)
 	if err != nil {
 		slog.Error("Failed to load client keys", "err", err)
-		return 1
+		return err
 	}
 
 	latestEntry, err := findEntryOnNetwork(getCfg, clientSigner, appCfg)
 	if err != nil {
 		slog.Error("Failed to find entry on network", "err", err)
-		return 1
+		return err
 	}
 
 	threshold := latestEntry.Threshold
 	if threshold <= 0 {
 		slog.Error("Invalid threshold found in entry", "key", getCfg.Key, "threshold", threshold)
-		return 1
+		return err
 	}
 
 	decryptedFragments, err := retrieveAndDecryptFragments(getCfg, appCfg, latestEntry, clientSigner, clientDecrypter)
 	if err != nil {
 		slog.Error("Failed to retrieve or decrypt fragments", "err", err)
-		return 1
+		return err
 	}
 
 	err = reconstructAndOutputSecret(decryptedFragments, threshold, getCfg.OutputFile)
 	if err != nil {
 		slog.Error("Failed to reconstruct secret or write output", "err", err)
-		return 1
+		return err
 	}
 
 	slog.Info("Get operation completed successfully")
-	return 0
+	return nil
 }
 
 // findLatestTimestampAndSource queries targets to find the latest timestamp for a key and the target holding it.

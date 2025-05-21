@@ -2,6 +2,7 @@ package genkeys
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -92,33 +93,31 @@ func writeKeyset(handle *keyset.Handle, path string) error {
 }
 
 // Run executes the genkeys operation.
-func Run(cfg *Config) int {
+func (cfg *Config) Run() error {
 	slog.Info("Starting key generation...")
 
 	// --- Check if files exist ---
 	if !cfg.Force {
 		if fileExists(cfg.PrivateKeyOut) {
 			slog.Error("Private key output file already exists. Use --force to overwrite.", "path", cfg.PrivateKeyOut)
-			return 1
+			return errors.New("already-exists")
 		}
 		if fileExists(cfg.PublicKeyOut) {
 			slog.Error("Public key output file already exists. Use --force to overwrite.", "path", cfg.PublicKeyOut)
-			return 1
+			return errors.New("already-exists")
 		}
 	}
 
 	// --- Generate Combined Private Keyset Handle ---
 	privateHandle, err := generateAndCombineKeys()
 	if err != nil {
-		slog.Error("Failed to generate combined private keyset", "err", err)
-		return 1
+		return err
 	}
 
 	// --- Extract Public Keyset Handle ---
 	publicHandle, err := privateHandle.Public()
 	if err != nil {
-		slog.Error("Failed to extract public keyset from private handle", "err", err)
-		return 1
+		return err
 	}
 
 	// --- Write Private Keyset ---
@@ -127,7 +126,7 @@ func Run(cfg *Config) int {
 		slog.Error("Failed to write private keyset", "path", cfg.PrivateKeyOut, "err", err)
 		// Attempt to clean up public key file if private write failed
 		_ = os.Remove(cfg.PublicKeyOut)
-		return 1
+		return err
 	}
 
 	// --- Write Public Keyset ---
@@ -136,9 +135,9 @@ func Run(cfg *Config) int {
 		slog.Error("Failed to write public keyset", "path", cfg.PublicKeyOut, "err", err)
 		// Clean up private key file as the process was not fully successful
 		_ = os.Remove(cfg.PrivateKeyOut)
-		return 1
+		return err
 	}
 
 	slog.Info("Key generation completed successfully.")
-	return 0
+	return nil
 }

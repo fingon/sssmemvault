@@ -232,35 +232,35 @@ func distributeEntryToPeers(targets []string, entry *pb.Entry) (successCount, er
 }
 
 // Run executes the push operation.
-func Run(pushCfg *Config) int {
+func (pushCfg *Config) Run() error {
 	slog.Info("Starting push operation...")
 
 	appCfg, err := loadConfigAndValidateInput(pushCfg)
 	if err != nil {
 		slog.Error("Failed to load or validate configuration/input", "err", err)
-		return 1
+		return err
 	}
 
 	slog.Debug("Loading master private key (signer)", "path", pushCfg.MasterPrivateKeyPath)
 	masterSigner, err := crypto.LoadSigner(pushCfg.MasterPrivateKeyPath)
 	if err != nil {
 		slog.Error("Failed to load master private key (signer)", "path", pushCfg.MasterPrivateKeyPath, "err", err)
-		return 1
+		return err
 	}
 	slog.Info("Loaded master private key (signer) successfully")
 
 	entry, err := prepareAndSignEntry(pushCfg, appCfg, masterSigner)
 	if err != nil {
 		slog.Error("Failed to prepare or sign entry", "err", err)
-		return 1
+		return err
 	}
 
 	_, errorCount := distributeEntryToPeers(pushCfg.Targets, entry)
 	if errorCount > 0 {
 		slog.Error("Push operation completed with errors", "failed_targets", errorCount)
-		return 1
+		return err
 	}
 
 	slog.Info("Push operation completed successfully")
-	return 0
+	return nil
 }

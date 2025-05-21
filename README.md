@@ -128,7 +128,7 @@ This creates the `sssmemvault` binary.
 
 The `sssmemvault` tool has four subcommands:
 
-*   `genkeys`: Generates combined private and public keyset files for a node or client.
+*   `gen keys`: Generates combined private and public keyset files for a node or client.
 *   `daemon`: Runs the sssmemvault daemon node.
     *   `--detach` / `-d`: Runs the daemon in the background. Requires `--pidfile` and `--logfile`.
     *   `--pidfile`: Path to the PID file (used with `--detach`). Default: `/var/run/sssmemvaultd.pid`. Can be set via `SSSMEMVAULT_PIDFILE` env var.
@@ -158,10 +158,10 @@ tinkey create-public-keyset --in master_private.json --out master_public.json
 
 **2. Generate Node A Combined Keyset**
 
-Use the new `sssmemvault genkeys` command.
+Use the `sssmemvault gen keys` command.
 
 ```bash
-./sssmemvault genkeys \
+./sssmemvault gen keys \
   --private-out nodeA_private.json \
   --public-out nodeA_public.json
 ```
@@ -169,7 +169,7 @@ Use the new `sssmemvault genkeys` command.
 **3. Generate Node B Combined Keyset**
 
 ```bash
-./sssmemvault genkeys \
+./sssmemvault gen keys \
   --private-out nodeB_private.json \
   --public-out nodeB_public.json
 ```
@@ -177,7 +177,7 @@ Use the new `sssmemvault genkeys` command.
 **4. Generate Client Combined Keyset**
 
 ```bash
-./sssmemvault genkeys \
+./sssmemvault gen keys \
   --private-out clientX_private.json \
   --public-out clientX_public.json
 ```
