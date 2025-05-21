@@ -126,8 +126,9 @@ This creates the `sssmemvault` binary.
 
 ## Commands ##
 
-The `sssmemvault` tool has four subcommands:
+The `sssmemvault` tool has five subcommands:
 
+*   `gen sign`: Generates signing private and public keyset files for master use.
 *   `gen keys`: Generates combined private and public keyset files for a node or client.
 *   `daemon`: Runs the sssmemvault daemon node.
     *   `--detach` / `-d`: Runs the daemon in the background. Requires `--pidfile` and `--logfile`.
@@ -147,13 +148,12 @@ We will use the `sssmemvault genkeys` command to generate the necessary combined
 
 **1. Generate Master Key Pair (Signing Only)**
 
-Only the master *signing* public key is needed by the nodes. Keep the master *signing* private key secure and offline (used only by `sssmemvault push`). We'll use Tink's `tinkey` tool for this specific key as `sssmemvault genkeys` creates combined keys. We'll use ED25519.
+Only the master *signing* public key is needed by the nodes. Keep the master *signing* private key secure and offline (used only by `sssmemvault push`).
 
 ```bash
-# Generate master signing private key
-tinkey create-keyset --key-template ED25519 --out master_private.json
-# Extract master signing public key
-tinkey create-public-keyset --in master_private.json --out master_public.json
+./sssmemvault gen sign \
+  --private-out master_private.json \
+  --public-out master_public.json
 ```
 
 **2. Generate Node A Combined Keyset**

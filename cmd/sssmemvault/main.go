@@ -8,6 +8,7 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/fingon/sssmemvault/internal/daemon"
 	"github.com/fingon/sssmemvault/internal/genkeys"
+	"github.com/fingon/sssmemvault/internal/gensign"
 	"github.com/fingon/sssmemvault/internal/get"
 	"github.com/fingon/sssmemvault/internal/push"
 	// Aliased to avoid conflict with internal daemon pkg
@@ -26,6 +27,7 @@ import (
 
 type genCLI struct {
 	Keys genkeys.Config `cmd:"" help:"Generate combined private and public keyset files."`
+	Sign gensign.Config `cmd:"" help:"Generate sign private and public keyset files."`
 }
 
 var cli struct {

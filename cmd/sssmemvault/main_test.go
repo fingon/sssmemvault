@@ -1,7 +1,6 @@
 package main_test
 
 import (
-	"bytes"
 	"context"
 	"net"
 	"os"
@@ -16,9 +15,6 @@ import (
 	// Register Tink primitives
 	_ "github.com/tink-crypto/tink-go/v2/aead"
 	_ "github.com/tink-crypto/tink-go/v2/hybrid"
-	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset"
-	"github.com/tink-crypto/tink-go/v2/keyset"
-	"github.com/tink-crypto/tink-go/v2/signature"
 	_ "github.com/tink-crypto/tink-go/v2/signature"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -59,54 +55,19 @@ type testNode struct {
 	Result  *icmd.Result
 }
 
-func runGenkeysCommand(t *testing.T, privPath, pubPath string) {
+func generateKeyset(t *testing.T, command, name string) testKeys {
 	t.Helper()
-	getCmd := icmd.Command("go", "run", ".", "gen", "keys",
+	tmpDir := t.TempDir()
+	dir, err := filepath.Abs(tmpDir)
+	assert.NilError(t, err)
+	privPath := filepath.Join(dir, name+"_private.json")
+	pubPath := filepath.Join(dir, name+"_public.json")
+	getCmd := icmd.Command("go", "run", ".", "gen", command,
 		"--private-out", privPath,
 		"--public-out", pubPath,
 	)
 	getResult := icmd.RunCmd(getCmd)
 	getResult.Assert(t, icmd.Success)
-	t.Logf("Genkeys successful.")
-}
-
-// generateCombinedKeyset generates combined private and public keyset files.
-func generateCombinedKeyset(t *testing.T, dir, name string) (privPath, pubPath string) {
-	t.Helper()
-
-	privPath = filepath.Join(dir, name+"_private.json")
-	pubPath = filepath.Join(dir, name+"_public.json")
-
-	runGenkeysCommand(t, privPath, pubPath)
-	return privPath, pubPath
-}
-
-// generateMasterKeys generates the master signing key pair (signing only).
-func generateMasterKeys(t *testing.T, dir string) testKeys {
-	t.Helper()
-	privPath := filepath.Join(dir, "master_private.json")
-	pubPath := filepath.Join(dir, "master_public.json")
-
-	handle, err := keyset.NewHandle(signature.ED25519KeyTemplate())
-	assert.NilError(t, err, "Failed to create master keyset handle")
-
-	// Write private
-	privBuf := new(bytes.Buffer)
-	writer := keyset.NewJSONWriter(privBuf)
-	err = insecurecleartextkeyset.Write(handle, writer)
-	assert.NilError(t, err, "Failed to write master private keyset")
-	err = os.WriteFile(privPath, privBuf.Bytes(), 0o600)
-	assert.NilError(t, err, "Failed to save master private keyset file")
-
-	// Write public
-	pubHandle, err := handle.Public()
-	assert.NilError(t, err, "Failed to get master public keyset handle")
-	pubBuf := new(bytes.Buffer)
-	pubWriter := keyset.NewJSONWriter(pubBuf)
-	err = insecurecleartextkeyset.Write(pubHandle, pubWriter)
-	assert.NilError(t, err, "Failed to write master public keyset")
-	err = os.WriteFile(pubPath, pubBuf.Bytes(), 0o600)
-	assert.NilError(t, err, "Failed to save master public keyset file")
 
 	return testKeys{PrivatePath: privPath, PublicPath: pubPath}
 }
@@ -220,12 +181,11 @@ func setupTestEnvironment(t *testing.T, nodeNames []string, ofs int) (
 	assert.NilError(t, err)
 
 	// Generate Master Key
-	masterKeys = generateMasterKeys(t, absTmpDir)
+	masterKeys = generateKeyset(t, "sign", "master")
 
 	// Generate Client Key
-	clientPrivPath, clientPubPath := generateCombinedKeyset(t, absTmpDir, clientName)
-	clientKeys = testKeys{PrivatePath: clientPrivPath, PublicPath: clientPubPath}
-	clientInfo := peerInfo{Name: clientName, PublicKeyPath: clientPubPath, Endpoint: "", Port: ""} // Client has no endpoint/port
+	clientKeys = generateKeyset(t, "keys", clientName)
+	clientInfo := peerInfo{Name: clientName, PublicKeyPath: clientKeys.PublicPath, Endpoint: "", Port: ""} // Client has no endpoint/port
 
 	// Generate Node Keys and Collect Peer Info
 	nodeInfos = make(map[string]peerInfo)
@@ -242,11 +202,11 @@ func setupTestEnvironment(t *testing.T, nodeNames []string, ofs int) (
 	}
 
 	for _, name := range nodeNames {
-		privPath, pubPath := generateCombinedKeyset(t, absTmpDir, name)
-		nodeKeyPaths[name] = privPath
+		keys := generateKeyset(t, "keys", name)
+		nodeKeyPaths[name] = keys.PrivatePath
 		info := peerInfo{
 			Name:          name,
-			PublicKeyPath: pubPath,
+			PublicKeyPath: keys.PublicPath,
 			Endpoint:      nodeEndpoints[name],
 			Port:          nodePorts[name],
 		}

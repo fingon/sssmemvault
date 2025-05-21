@@ -26,8 +26,8 @@ type Config struct {
 	// LogLevel is handled globally
 }
 
-// fileExists checks if a file exists and is not a directory.
-func fileExists(filename string) bool {
+// FileExists checks if a file exists and is not a directory.
+func FileExists(filename string) bool {
 	info, err := os.Stat(filename)
 	if os.IsNotExist(err) {
 		return false
@@ -75,8 +75,8 @@ func generateAndCombineKeys() (*keyset.Handle, error) {
 	return combinedHandle, nil
 }
 
-// writeKeyset writes a keyset handle to a file using JSON format.
-func writeKeyset(handle *keyset.Handle, path string) error {
+// WriteKeyset writes a keyset handle to a file using JSON format.
+func WriteKeyset(handle *keyset.Handle, path string) error {
 	buf := new(bytes.Buffer)
 	writer := keyset.NewJSONWriter(buf)
 	// Use insecurecleartextkeyset for writing private keys (and public for consistency)
@@ -98,11 +98,11 @@ func (cfg *Config) Run() error {
 
 	// --- Check if files exist ---
 	if !cfg.Force {
-		if fileExists(cfg.PrivateKeyOut) {
+		if FileExists(cfg.PrivateKeyOut) {
 			slog.Error("Private key output file already exists. Use --force to overwrite.", "path", cfg.PrivateKeyOut)
 			return errors.New("already-exists")
 		}
-		if fileExists(cfg.PublicKeyOut) {
+		if FileExists(cfg.PublicKeyOut) {
 			slog.Error("Public key output file already exists. Use --force to overwrite.", "path", cfg.PublicKeyOut)
 			return errors.New("already-exists")
 		}
@@ -121,7 +121,7 @@ func (cfg *Config) Run() error {
 	}
 
 	// --- Write Private Keyset ---
-	err = writeKeyset(privateHandle, cfg.PrivateKeyOut)
+	err = WriteKeyset(privateHandle, cfg.PrivateKeyOut)
 	if err != nil {
 		slog.Error("Failed to write private keyset", "path", cfg.PrivateKeyOut, "err", err)
 		// Attempt to clean up public key file if private write failed
@@ -130,7 +130,7 @@ func (cfg *Config) Run() error {
 	}
 
 	// --- Write Public Keyset ---
-	err = writeKeyset(publicHandle, cfg.PublicKeyOut)
+	err = WriteKeyset(publicHandle, cfg.PublicKeyOut)
 	if err != nil {
 		slog.Error("Failed to write public keyset", "path", cfg.PublicKeyOut, "err", err)
 		// Clean up private key file as the process was not fully successful
