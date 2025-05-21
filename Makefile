@@ -4,8 +4,8 @@
 # Copyright (c) 2025 Markus Stenberg
 #
 # Created:       Sun Apr 13 08:23:25 2025 mstenber
-# Last modified: Sat Apr 26 16:50:34 2025 mstenber
-# Edit time:     7 min
+# Last modified: Wed May 21 16:10:37 2025 mstenber
+# Edit time:     8 min
 #
 #
 
@@ -54,7 +54,7 @@ lint:
 	mv $@.tmp $@
 	go tool goimports -w $@
 
-$(BINARY): $(GENERATED)
+$(BINARY): $(wildcard *.go */*.go */*/*.go)
 	go build -o $@ ./cmd/$@
 
 # Clean target (optional but good practice)
