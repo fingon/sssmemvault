@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fingon/sssmemvault/internal/config"
+	"github.com/fingon/sssmemvault/internal/crypto"
 	"github.com/fingon/sssmemvault/internal/server"
 	"github.com/fingon/sssmemvault/internal/store"
 	"github.com/fingon/sssmemvault/internal/synchronizer"
@@ -48,6 +49,7 @@ type Config struct {
 	PidFile             string        `kong:"name='pidfile',default='${pid_file_default}',help='Path to the PID file when detaching.',env='SSSMEMVAULT_PIDFILE'"`
 	LogFile             string        `kong:"name='logfile',default='${log_file_default}',help='Path to the log file when detaching.',env='SSSMEMVAULT_LOGFILE'"`
 	ConfigCheckInterval time.Duration `kong:"name='config-check-interval',default='${config_check_interval_default}',help='How often to check the config file for changes (e.g., 60s, 5m). 0 disables reloading.'"`
+	OwnPrivateKeyValue  string        `kong:"name='own-private-key-value',env='SSSMEMVAULT_OWN_PRIVATE_KEY',help='This node\\'s private key JSON content. Overrides private_key_path in config file.'"`
 	// LogLevel is handled globally (but needs consideration for detached logging)
 
 	// Internal fields for default value injection by Kong
@@ -278,8 +280,25 @@ func initializeDaemonState(daemonCfg *Config) (*daemonState, error) {
 		return nil, fmt.Errorf("failed to load daemon config: %w", err)
 	}
 
+	// Load own private key from value if provided, overriding config file path
+	if daemonCfg.OwnPrivateKeyValue != "" {
+		slog.Info("Loading own private key (signer and decrypter) from value (environment variable or direct input)")
+		signer, err := crypto.LoadSignerFromValue(daemonCfg.OwnPrivateKeyValue)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load own private key signer from value: %w", err)
+		}
+		decrypter, err := crypto.LoadDecrypterFromValue(daemonCfg.OwnPrivateKeyValue)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load own private key decrypter from value: %w", err)
+		}
+		state.appCfg.PrivKeySigner = signer
+		state.appCfg.PrivKeyDecrypter = decrypter
+		// Clear PrivateKeyPath in appCfg to indicate it was overridden
+		state.appCfg.PrivateKeyPath = ""
+	}
+
 	if state.appCfg.PrivKeySigner == nil || state.appCfg.PrivKeyDecrypter == nil {
-		return nil, fmt.Errorf("daemon requires both signing and decryption keys loaded from private_key_path %q", state.appCfg.PrivateKeyPath)
+		return nil, errors.New("daemon requires both signing and decryption keys; ensure 'private_key_path' is set in config or '--own-private-key-value' is provided")
 	}
 
 	state.localStore, err = initializeStore(state.appCfg)

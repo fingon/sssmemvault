@@ -112,6 +112,22 @@ func LoadDecrypter(path string) (tink.HybridDecrypt, error) {
 	return nil, fmt.Errorf("no tink.HybridDecrypt primitive found in keyset %q", path)
 }
 
+// LoadDecrypterFromValue loads the HybridDecrypt primitive from a keyset JSON string.
+func LoadDecrypterFromValue(jsonKeyset string) (tink.HybridDecrypt, error) {
+	ps, err := getPrimitivesFromKeysetValue(jsonKeyset)
+	if err != nil {
+		return nil, err
+	}
+	for _, entryList := range ps.Entries {
+		for _, entry := range entryList {
+			if decrypter, ok := entry.Primitive.(tink.HybridDecrypt); ok {
+				return decrypter, nil
+			}
+		}
+	}
+	return nil, errors.New("no tink.HybridDecrypt primitive found in keyset value")
+}
+
 // LoadVerifier loads the Verifier primitive from a keyset file.
 // It expects the primary key in the keyset to be a verification key.
 func LoadVerifier(path string) (tink.Verifier, error) {
