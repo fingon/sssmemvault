@@ -46,9 +46,9 @@ type Config struct {
 	LoadedPeers      map[string]*PeerConfig `yaml:"-"` // Processed peers with loaded keys (map key is Name)
 }
 
-// loadConfigInternal performs the core logic of reading, unmarshalling, validating,
+// loadConfig2 performs the core logic of reading, unmarshalling, validating,
 // and loading keys from a configuration file.
-func loadConfigInternal(path string, ignoreOwnKeyErrors bool) (*Config, error) {
+func LoadConfig2(path string, ignoreOwnKeyErrors bool) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file %q: %w", path, err)
@@ -143,14 +143,14 @@ func loadConfigInternal(path string, ignoreOwnKeyErrors bool) (*Config, error) {
 
 // LoadConfig reads the configuration file, validates it, and loads keys.
 func LoadConfig(path string) (*Config, error) {
-	return loadConfigInternal(path, false)
+	return LoadConfig2(path, false)
 }
 
 // LoadConfigIgnoreOwnKey reads the configuration file, validates it, and loads keys,
 // but specifically ignores errors related to loading the node's own private key.
 // Useful for client tools (like push or get) that use a different key for their operations.
 func LoadConfigIgnoreOwnKey(path string) (*Config, error) {
-	return loadConfigInternal(path, true)
+	return LoadConfig2(path, true)
 }
 
 // loadOwnPrivateKeys loads the signer and decrypter from the configured private key path.

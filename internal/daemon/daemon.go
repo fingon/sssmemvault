@@ -51,7 +51,7 @@ type Config struct {
 	ConfigCheckInterval time.Duration `kong:"name='config-check-interval',default='${config_check_interval_default}',help='How often to check the config file for changes (e.g., 60s, 5m). 0 disables reloading.'"`
 	OwnPrivateKeyValue  string        `kong:"name='own-private-key-value',env='SSSMEMVAULT_OWN_PRIVATE_KEY',help='This node\\'s private key JSON content. Overrides private_key_path in config file.'"`
 	// LogLevel is handled globally (but needs consideration for detached logging)
-
+	DetachRestart bool `kong:"help='Restart daemon if it was already running.'"`
 	// Internal fields for default value injection by Kong
 	PidFileDefault             string `kong:"-"`
 	LogFileDefault             string `kong:"-"`
@@ -83,9 +83,9 @@ var reloadSignal = make(chan struct{}, 1)
 // --- Helper Functions ---
 
 // loadDaemonConfig loads the application configuration.
-func loadDaemonConfig(configPath string) (*config.Config, error) {
+func loadDaemonConfig(configPath string, ignoreOwnKeyErrors bool) (*config.Config, error) {
 	slog.Info("Loading configuration file", "path", configPath)
-	appCfg, err := config.LoadConfig(configPath)
+	appCfg, err := config.LoadConfig2(configPath, ignoreOwnKeyErrors)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load configuration: %w", err)
 	}
@@ -275,7 +275,7 @@ func initializeDaemonState(daemonCfg *Config) (*daemonState, error) {
 	state := &daemonState{}
 	var err error
 
-	state.appCfg, err = loadDaemonConfig(daemonCfg.ConfigPath)
+	state.appCfg, err = loadDaemonConfig(daemonCfg.ConfigPath, daemonCfg.OwnPrivateKeyValue != "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to load daemon config: %w", err)
 	}
@@ -433,11 +433,23 @@ func (self *Config) Run() error {
 			Umask:       0o027, // Restrict file permissions created by daemon
 		}
 
+		daemon, err := cntxt.Search()
+		if err != nil {
+			slog.Error("Failed to search for daemon", "err", err)
+			return err
+		}
+
+		if daemon != nil && !self.DetachRestart {
+			slog.Info("Already running. Use --detach-restart to force restart.")
+			return nil
+		}
+		// TODO: I wonder if we should kill the previous
+		// daemon in DetachRestart case?
+
 		d, err := cntxt.Reborn()
 		if err != nil {
-			// Probably old instance is running, which is fine?
 			slog.Error("Failed to detach daemon process", "err", err)
-			return nil
+			return err
 		}
 		if d != nil {
 			// Parent process: successfully detached, exit gracefully.
