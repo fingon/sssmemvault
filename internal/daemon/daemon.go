@@ -436,7 +436,7 @@ func (self *Config) Run() error {
 		daemon, err := cntxt.Search()
 		if err != nil {
 			slog.Error("Failed to search for daemon", "err", err)
-			return err
+			daemon = nil
 		}
 
 		if daemon != nil && !self.DetachRestart {
