@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -18,13 +19,14 @@ import (
 
 // Config holds the specific configuration needed for the push subcommand.
 type Config struct {
-	MasterPrivateKeyPath string `kong:"name='master-private-key',required,xor='key-source',help='Path to the master private key JSON file (signing only).'"`
-	MasterPrivateKey     string `kong:"name='master-private-key-value',required,xor='key-source',env='SSSMEMVAULT_MASTER_PRIVATE_KEY',help='The master private key JSON content (signing only). Can be supplied via SSSMEMVAULT_MASTER_PRIVATE_KEY environment variable.'"`
+	MasterPrivateKeyPath string `kong:"name='master-private-key',xor='key-source',required,help='Path to the master private key JSON file (signing only).'"`
+	MasterPrivateKey     string `kong:"name='master-private-key-value',xor='key-source',required,env='SSSMEMVAULT_MASTER_PRIVATE_KEY',help='The master private key JSON content (signing only). Can be supplied via SSSMEMVAULT_MASTER_PRIVATE_KEY environment variable.'"`
 
-	Readers   []string `kong:"name='reader',required,help='Name of a node allowed to read the secret. Repeat for each reader.'"`
-	Key       string   `kong:"name='key',required,help='The key name for the secret.'"`
-	Secret    string   `kong:"name='secret',required,help='The secret value to store.'"`
-	Threshold int      `kong:"name='threshold',short='t',required,help='Shamir threshold (number of fragments needed to reconstruct).'"`
+	Readers     []string `kong:"name='reader',required,help='Name of a node allowed to read the secret. Repeat for each reader.'"`
+	Key         string   `kong:"name='key',required,help='The key name for the secret.'"`
+	SecretPath  string   `kong:"name='secret-file',xor='secret-source',required,help='Path to a file containing the secret value.'"`
+	SecretValue string   `kong:"name='secret',xor='secret-source',required,env='SSSMEMVAULT_SECRET',help='The secret value to store. Can be supplied via SSSMEMVAULT_SECRET environment variable.'"`
+	Threshold   int      `kong:"name='threshold',short='t',required,help='Shamir threshold (number of fragments needed to reconstruct).'"`
 	// Parts is now calculated based on sum of fragments_per_owner in config for owner peers.
 	Targets    []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
 	ConfigPath string   `kong:"name='config',required,help='Path to a configuration file to load parameters from (peers, targets).'"`
@@ -70,7 +72,8 @@ func loadConfigAndValidateInput(pushCfg *Config) (*config.Config, error) {
 	if len(pushCfg.Targets) == 0 {
 		return nil, errors.New("no targets specified. Provide via --target flags or derive from --config file")
 	}
-	// Key and Secret presence is ensured by `kong:"required"`
+	// Key presence is ensured by `kong:"required"`.
+	// Secret presence is ensured by `xor` group `secret-source`.
 
 	return appCfg, nil
 }
@@ -154,8 +157,8 @@ func createEncryptedFragments(secret string, threshold int, appCfg *config.Confi
 }
 
 // prepareAndSignEntry creates encrypted fragments, builds the protobuf Entry, and signs it.
-func prepareAndSignEntry(pushCfg *Config, appCfg *config.Config, masterSigner tink.Signer) (*pb.Entry, error) {
-	ownerEncryptedFragments, err := createEncryptedFragments(pushCfg.Secret, pushCfg.Threshold, appCfg)
+func prepareAndSignEntry(pushCfg *Config, appCfg *config.Config, masterSigner tink.Signer, secretContent string) (*pb.Entry, error) {
+	ownerEncryptedFragments, err := createEncryptedFragments(secretContent, pushCfg.Threshold, appCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare fragments: %w", err)
 	}
@@ -260,7 +263,25 @@ func (pushCfg *Config) Run() error {
 	}
 	slog.Info("Loaded master private key (signer) successfully")
 
-	entry, err := prepareAndSignEntry(pushCfg, appCfg, masterSigner)
+	var secretContent string
+	switch {
+	case pushCfg.SecretValue != "":
+		secretContent = pushCfg.SecretValue
+		slog.Debug("Using secret from direct value (flag or environment variable)")
+	case pushCfg.SecretPath != "":
+		slog.Debug("Loading secret from file", "path", pushCfg.SecretPath)
+		data, err := os.ReadFile(pushCfg.SecretPath)
+		if err != nil {
+			slog.Error("Failed to read secret file", "path", pushCfg.SecretPath, "err", err)
+			return fmt.Errorf("failed to read secret file %q: %w", pushCfg.SecretPath, err)
+		}
+		secretContent = string(data)
+		slog.Info("Secret loaded from file successfully")
+	default:
+		// Probably not reachable but just in case
+		return errors.New("no secret provided via --secret or --secret-file or SSSMEMVAULT_SECRET environment variable")
+	}
+	entry, err := prepareAndSignEntry(pushCfg, appCfg, masterSigner, secretContent)
 	if err != nil {
 		slog.Error("Failed to prepare or sign entry", "err", err)
 		return err

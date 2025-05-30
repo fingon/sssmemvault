@@ -252,7 +252,7 @@ Ensure the `sssmemvault` binary is built (`make sssmemvault`).
 ```bash
 # Example: config.yaml on Node A should have:
 # private_key_path: "nodeA_private.json"
-# master_public_key_path: "master_public.json"
+# master_public_path: "master_public.json"
 # ...
 # peers:
 #   "node-A":
@@ -319,6 +319,7 @@ Use the `sssmemvault push` subcommand. This requires the *master signing private
 # Readable by Node A, Node B, and the client client-X.
 # Targets are derived from config unless specified with --target.
 
+# Option 1: Provide secret directly via flag
 ./sssmemvault push \
   --master-private-key master_private.json \
   --config config.yaml \
@@ -329,6 +330,32 @@ Use the `sssmemvault push` subcommand. This requires the *master signing private
   --secret "supersecret123" \
   --threshold 2 \
   --log-level info
+
+# Option 2: Provide secret via environment variable
+# export SSSMEMVAULT_SECRET="supersecret123"
+# ./sssmemvault push \
+#   --master-private-key master_private.json \
+#   --config config.yaml \
+#   --reader node-A \
+#   --reader node-B \
+#   --reader client-X \
+#   --key "api-key" \
+#   --secret "" \ # --secret must still be present if using env var, but can be empty
+#   --threshold 2 \
+#   --log-level info
+
+# Option 3: Provide secret via file
+# echo "supersecret123" > my_secret.txt
+# ./sssmemvault push \
+#   --master-private-key master_private.json \
+#   --config config.yaml \
+#   --reader node-A \
+#   --reader node-B \
+#   --reader client-X \
+#   --key "api-key" \
+#   --secret-file my_secret.txt \
+#   --threshold 2 \
+#   --log-level info
 ```
 
 This command will:
