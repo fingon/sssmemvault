@@ -21,12 +21,13 @@ import (
 // Config holds the specific configuration needed for the get subcommand.
 type Config struct {
 	// LogLevel is handled globally
-	ClientName     string   `kong:"name='client-name',required,help='The name of this client (must match a key in target node configs).'"`
-	PrivateKeyPath string   `kong:"name='private-key',required,help='Path to the client combined private keyset JSON file (signing + hybrid).'"`
-	Key            string   `kong:"name='key',required,help='The key name for the secret to retrieve.'"`
-	OutputFile     string   `kong:"name='output',short='o',help='Path to write the reconstructed secret to (stdout if not specified).'"`
-	Targets        []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to query. Repeat for each target. Can be sourced from --config.'"`
-	ConfigPath     string   `kong:"name='config',required,help='Path to a configuration file to load parameters from (targets, peer info).'"` // Made required
+	ClientName     string        `kong:"name='client-name',required,help='The name of this client (must match a key in target node configs).'"`
+	PrivateKeyPath string        `kong:"name='private-key',required,help='Path to the client combined private keyset JSON file (signing + hybrid).'"`
+	Key            string        `kong:"name='key',required,help='The key name for the secret to retrieve.'"`
+	OutputFile     string        `kong:"name='output',short='o',help='Path to write the reconstructed secret to (stdout if not specified).'"`
+	Targets        []string      `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to query. Repeat for each target. Can be sourced from --config.'"`
+	ConfigPath     string        `kong:"name='config',required,help='Path to a configuration file to load parameters from (targets, peer info).'"` // Made required
+	Timeout        time.Duration `kong:"name='timeout',default='3s',help='Overall timeout for the get operation.'"`
 }
 
 // loadConfigAndValidateInput loads the application configuration, derives targets if not specified,
@@ -91,8 +92,8 @@ func loadClientKeys(privateKeyPath string) (tink.Signer, tink.HybridDecrypt, err
 }
 
 // findEntryOnNetwork finds the latest entry for a given key across the target nodes.
-func findEntryOnNetwork(getCfg *Config, clientSigner tink.Signer, appCfg *config.Config) (*pb.Entry, error) {
-	latestEntry, _, err := findLatestEntry(getCfg.Targets, getCfg.Key, getCfg.ClientName, clientSigner, appCfg)
+func findEntryOnNetwork(ctx context.Context, getCfg *Config, clientSigner tink.Signer, appCfg *config.Config) (*pb.Entry, error) {
+	latestEntry, _, err := findLatestEntry(ctx, getCfg.Targets, getCfg.Key, getCfg.ClientName, clientSigner, appCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find latest entry for key %q (client %s): %w", getCfg.Key, getCfg.ClientName, err)
 	}
@@ -208,7 +209,7 @@ func decryptReceivedFragments(encryptedFragments [][]byte, clientDecrypter tink.
 }
 
 // retrieveAndDecryptFragments orchestrates fetching and decrypting fragments.
-func retrieveAndDecryptFragments(getCfg *Config, appCfg *config.Config, latestEntry *pb.Entry, clientSigner tink.Signer, clientDecrypter tink.HybridDecrypt) ([][]byte, error) {
+func retrieveAndDecryptFragments(ctx context.Context, getCfg *Config, appCfg *config.Config, latestEntry *pb.Entry, clientSigner tink.Signer, clientDecrypter tink.HybridDecrypt) ([][]byte, error) {
 	ownerNames := make([]string, 0, len(latestEntry.OwnerFragments))
 	for name := range latestEntry.OwnerFragments {
 		ownerNames = append(ownerNames, name)
@@ -221,9 +222,7 @@ func retrieveAndDecryptFragments(getCfg *Config, appCfg *config.Config, latestEn
 		return nil, fmt.Errorf("failed to determine owner endpoints: %w", err)
 	}
 
-	getDecodedCtx, getDecodedCancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer getDecodedCancel()
-	encryptedFragments, getDecodedErrors := fetchEncryptedFragmentsFromOwners(getDecodedCtx, ownerEndpoints, getCfg.ClientName, clientSigner, latestEntry)
+	encryptedFragments, getDecodedErrors := fetchEncryptedFragmentsFromOwners(ctx, ownerEndpoints, getCfg.ClientName, clientSigner, latestEntry)
 
 	if len(getDecodedErrors) > 0 {
 		slog.Warn("Failed to retrieve fragments from some owners", "errors", getDecodedErrors)
@@ -277,6 +276,9 @@ func reconstructAndOutputSecret(decryptedFragments [][]byte, threshold int32, ou
 func (getCfg *Config) Run() error {
 	slog.Info("Starting get operation...")
 
+	ctx, cancel := context.WithTimeout(context.Background(), getCfg.Timeout)
+	defer cancel()
+
 	appCfg, err := loadConfigAndValidateInput(getCfg)
 	if err != nil {
 		slog.Error("Failed to load or validate configuration/input", "err", err)
@@ -289,7 +291,7 @@ func (getCfg *Config) Run() error {
 		return err
 	}
 
-	latestEntry, err := findEntryOnNetwork(getCfg, clientSigner, appCfg)
+	latestEntry, err := findEntryOnNetwork(ctx, getCfg, clientSigner, appCfg)
 	if err != nil {
 		slog.Error("Failed to find entry on network", "err", err)
 		return err
@@ -301,7 +303,7 @@ func (getCfg *Config) Run() error {
 		return err
 	}
 
-	decryptedFragments, err := retrieveAndDecryptFragments(getCfg, appCfg, latestEntry, clientSigner, clientDecrypter)
+	decryptedFragments, err := retrieveAndDecryptFragments(ctx, getCfg, appCfg, latestEntry, clientSigner, clientDecrypter)
 	if err != nil {
 		slog.Error("Failed to retrieve or decrypt fragments", "err", err)
 		return err
@@ -424,10 +426,7 @@ func fetchFullEntry(ctx context.Context, targetEndpoint, key, clientName string,
 // findLatestEntry queries targets to find the latest timestamp for a key and returns the full entry.
 // It requires the clientName for authenticating requests to the target nodes.
 // The appCfg parameter is currently unused but kept for potential future use (e.g., master key verification).
-func findLatestEntry(targets []string, key, clientName string, clientSigner tink.Signer, _ *config.Config) (*pb.Entry, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
+func findLatestEntry(ctx context.Context, targets []string, key, clientName string, clientSigner tink.Signer, _ *config.Config) (*pb.Entry, string, error) {
 	// 1. Find the latest timestamp and the target holding it
 	latestTimestamp, sourceTarget, err := findLatestTimestampAndSource(ctx, targets, key, clientName, clientSigner)
 	if err != nil {

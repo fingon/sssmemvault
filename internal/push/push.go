@@ -28,8 +28,9 @@ type Config struct {
 	SecretValue string   `kong:"name='secret',xor='secret-source',required,env='SSSMEMVAULT_SECRET',help='The secret value to store. Can be supplied via SSSMEMVAULT_SECRET environment variable.'"`
 	Threshold   int      `kong:"name='threshold',short='t',required,help='Shamir threshold (number of fragments needed to reconstruct).'"`
 	// Parts is now calculated based on sum of fragments_per_owner in config for owner peers.
-	Targets    []string `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
-	ConfigPath string   `kong:"name='config',required,help='Path to a configuration file to load parameters from (peers, targets).'"`
+	Targets    []string      `kong:"name='target',optional,help='Endpoint address (host:port) of a target node to push to. Repeat for each target. Can be sourced from --config.'"`
+	ConfigPath string        `kong:"name='config',required,help='Path to a configuration file to load parameters from (peers, targets).'"`
+	Timeout    time.Duration `kong:"name='timeout',default='3s',help='Overall timeout for the push operation.'"`
 }
 
 // loadConfigAndValidateInput loads the application configuration, derives targets if not specified,
@@ -181,21 +182,17 @@ func prepareAndSignEntry(pushCfg *Config, appCfg *config.Config, masterSigner ti
 }
 
 // distributeEntryToPeers pushes the signed entry to all target nodes concurrently.
-func distributeEntryToPeers(targets []string, entry *pb.Entry) (successCount, errorCount int) {
+func distributeEntryToPeers(ctx context.Context, targets []string, entry *pb.Entry) (successCount, errorCount int) {
 	pushRequest := &pb.PushRequest{Entry: entry}
 	var wg sync.WaitGroup
 	var mu sync.Mutex // To protect counters
-
-	// Use a shared context for all push operations
-	pushCtx, pushCancel := context.WithTimeout(context.Background(), 60*time.Second) // Overall timeout for pushing
-	defer pushCancel()
 
 	for _, target := range targets {
 		wg.Add(1)
 		go func(targetEndpoint string) {
 			defer wg.Done()
 			slog.Info("Connecting to target node", "endpoint", targetEndpoint)
-			conn, err := node.DialPeer(pushCtx, targetEndpoint) // Use a simplified dial function
+			conn, err := node.DialPeer(ctx, targetEndpoint) // Use the passed context
 			if err != nil {
 				slog.Error("Failed to connect to target", "endpoint", targetEndpoint, "err", err)
 				mu.Lock()
@@ -212,7 +209,7 @@ func distributeEntryToPeers(targets []string, entry *pb.Entry) (successCount, er
 
 			client := pb.NewSssMemVaultClient(conn)
 			// Use a derived context with a shorter timeout for the actual RPC call
-			callCtx, callCancel := context.WithTimeout(pushCtx, 30*time.Second)
+			callCtx, callCancel := context.WithTimeout(ctx, 30*time.Second)
 			defer callCancel()
 
 			slog.Info("Pushing entry to target", "endpoint", targetEndpoint, "key", entry.Key)
@@ -238,6 +235,9 @@ func distributeEntryToPeers(targets []string, entry *pb.Entry) (successCount, er
 // Run executes the push operation.
 func (pushCfg *Config) Run() error {
 	slog.Info("Starting push operation...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), pushCfg.Timeout)
+	defer cancel()
 
 	appCfg, err := loadConfigAndValidateInput(pushCfg)
 	if err != nil {
@@ -287,7 +287,7 @@ func (pushCfg *Config) Run() error {
 		return err
 	}
 
-	_, errorCount := distributeEntryToPeers(pushCfg.Targets, entry)
+	_, errorCount := distributeEntryToPeers(ctx, pushCfg.Targets, entry)
 	if errorCount > 0 {
 		slog.Error("Push operation completed with errors", "failed_targets", errorCount)
 		return err
