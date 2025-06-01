@@ -1,11 +1,9 @@
 # sssmemvault #
 
-Disclaimer: This is pre-alpha code. This disclaimer will probably go
-away once all TODOs in the end of the README are done, and first
-release happens. This is mostly exercise in AI assisted coding as this
+Disclaimer: This is mostly exercise in AI assisted coding as this
 isn't high priority enough for me to spend significant time on, but it
-is good testbench for 'let AI code, let me verify' model of work. (And
-yes, I need the tool, once it is done.)
+is good testbench for 'let AI code, let me verify' model of work. I am
+using it in my homelab, and so could you, if you wish.
 
 ## Motivation ##
 
@@ -401,9 +399,3 @@ This command will:
 5. Decrypt the received fragments using the client's private key.
 6. Combine the decrypted fragments to reconstruct the original secret.
 7. Print the reconstructed secret to standard output.
-
-# TODO #
-
-- Make first release once all known TODOs are done
-
-- Make sure this actually works for real (in my homelab)
